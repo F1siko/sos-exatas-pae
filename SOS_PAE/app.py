@@ -1555,7 +1555,7 @@ def view_diretorio(aluno, perfil, usuario):
         profs = DB().get("professores", [])
         rows_p = []
         for p in profs:
-            ats = [s for al in alunos.values() for s in al.get("atendimentos_processo", []) if s.get("professor"] == p["nome"]]
+            ats = [s for al in alunos.values() for s in al.get("atendimentos_processo", []) if s.get("professor") == p["nome"]]
             horas = sum(s.get("duracao_h", 1.5) for s in ats)
             rows_p.append({"Código": p["id"], "Nome": p["nome"], "Disciplina": p["disciplina"], "Contato": p["contato"],
                            "Valor Hora": f"R$ {p.get('valor_hora', 90):.2f}", "Atendimentos": len(ats),
