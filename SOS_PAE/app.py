@@ -2018,7 +2018,7 @@ def view_produtividade(aluno, perfil, usuario):
     st.title("Produtividade da Equipe Pedagógica")
     rows = []
     for p in DB().get("professores", []):
-        ats = [s for al in DB()["alunos"].values() for s in al.get("atendimentos_processo", []) if s.get("professor"] == p["nome"]]
+        ats = [s for al in DB()["alunos"].values() for s in al.get("atendimentos_processo", []) if s.get("professor") == p["nome"]]
         h = sum(s.get("duracao_h", 1.5) for s in ats)
         rows.append({"Professor": p["nome"], "Disciplina": p["disciplina"], "Aulas": len(ats),
                      "Horas": round(h, 2), "Repasse Estimado (R$)": round(h * p.get("valor_hora", 90), 2)})
