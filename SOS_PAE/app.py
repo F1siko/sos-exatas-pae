@@ -1666,22 +1666,88 @@ def view_cockpit(aluno, perfil, usuario):
 def view_upload_fichas(aluno, perfil, usuario):
     d = aluno["dados"]
     st.title(f"Gestão de Fichas — {d['nome']}")
+    
+    materiais_nuvem = mat_listar_nuvem()
+    
     with st.form("form_upload_ficha", clear_on_submit=True):
-        tit = st.text_input("Título da Ficha")
+        origem = st.radio("Origem da Ficha:", ["Fazer Upload de Novo Arquivo", "Selecionar do Material Oficial (Nuvem)"], horizontal=True)
+        
         profs = [p["nome"] for p in DB()["professores"]]
         resp = st.selectbox("Professor Responsável:", profs, index=profs.index(usuario["nome"]) if usuario["nome"] in profs else 0)
-        arq = st.file_uploader("Arquivo PDF:", type=["pdf"])
-        if st.form_submit_button("Publicar Ficha"):
-            if tit.strip() and arq:
-                nome = salvar_upload(arq, PASTA_FICHAS, d["id"])
-                aluno["fichas_disponibilizadas"].append({"nome_arquivo": nome, "titulo": tit.strip(),
-                                                         "data_upload": str(date.today()), "uploaded_by": resp})
-                notificar(d["id"], "📄 Nova ficha disponível", tit.strip(), origem="professor")
-                auditar("ficha_publicada", f"{d['id']} {nome}")
-                _salvar_e_recarregar("Ficha publicada!")
+        
+        if origem == "Fazer Upload de Novo Arquivo":
+            tit = st.text_input("Título da Ficha")
+            arq = st.file_uploader("Arquivo PDF:", type=["pdf", "docx", "doc", "xlsx", "pptx", "png", "jpg", "jpeg", "zip"])
+            material_selecionado = None
+        else:
+            if not materiais_nuvem:
+                st.warning("Nenhum material cadastrado no Material Oficial ainda.")
+                material_selecionado = None
+                tit = ""
+                arq = None
             else:
-                st.error("Informe o título e anexe o PDF.")
+                mat_escolhido = st.selectbox(
+                    "Selecione o material do banco de dados:",
+                    materiais_nuvem,
+                    format_func=lambda m: f"{m['titulo']} ({m['disciplina']} • {m['serie']} — {m['tipo']})"
+                )
+                material_selecionado = mat_escolhido
+                tit = mat_escolhido["titulo"] if mat_escolhido else ""
+                arq = None
+                
+        if st.form_submit_button("Publicar Ficha para o Aluno"):
+            if origem == "Fazer Upload de Novo Arquivo":
+                if tit.strip() and arq:
+                    nome = salvar_upload(arq, PASTA_FICHAS, d["id"])
+                    aluno["fichas_disponibilizadas"].append({
+                        "nome_arquivo": nome,
+                        "titulo": tit.strip(),
+                        "data_upload": str(date.today()),
+                        "uploaded_by": resp,
+                        "is_nuvem": False
+                    })
+                    notificar(d["id"], "📄 Nova ficha disponível", tit.strip(), origem="professor")
+                    auditar("ficha_publicada", f"{d['id']} {nome}")
+                    _salvar_e_recarregar("Ficha publicada com sucesso!")
+                else:
+                    st.error("Informe o título e anexe o arquivo.")
+            else:
+                if material_selecionado:
+                    aluno["fichas_disponibilizadas"].append({
+                        "nome_arquivo": material_selecionado["file_path"],
+                        "file_path": material_selecionado["file_path"],
+                        "titulo": material_selecionado["titulo"],
+                        "data_upload": str(date.today()),
+                        "uploaded_by": resp,
+                        "is_nuvem": True
+                    })
+                    notificar(d["id"], "📄 Nova ficha disponível", material_selecionado["titulo"], origem="professor")
+                    auditar("ficha_publicada_nuvem", f"{d['id']} {material_selecionado['titulo']}")
+                    _salvar_e_recarregar("Ficha do Material Oficial vinculada com sucesso!")
+                else:
+                    st.error("Selecione um material válido do banco de dados.")
 
+
+def view_fichas_aluno(aluno, perfil, usuario):
+    st.title("Central de Fichas de Estudo")
+    fichas = aluno.get("fichas_disponibilizadas", [])
+    if not fichas:
+        st.info("Nenhuma ficha disponibilizada no momento.")
+    for i, f in enumerate(fichas):
+        with st.container(border=True):
+            a, b = st.columns([3, 1])
+            a.markdown(f"📄 **{esc(f['titulo'])}**")
+            a.caption(f"Disponibilizado por {esc(f['uploaded_by'])} em {f['data_upload']}")
+            with b:
+                if f.get("is_nuvem") or f.get("file_path"):
+                    try:
+                        path_or_url = f.get("file_path") or f.get("nome_arquivo")
+                        url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(path_or_url)
+                        st.markdown(f"[📥 Baixar Ficha]({url})", unsafe_allow_html=True)
+                    except Exception:
+                        st.caption("Arquivo indisponível")
+                else:
+                    botao_download("⬇️ Baixar Ficha", PASTA_FICHAS, f["nome_arquivo"], f"dl_{i}")
 
 def view_fichas_aluno(aluno, perfil, usuario):
     st.title("Central de Fichas de Estudo")
