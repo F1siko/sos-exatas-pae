@@ -121,8 +121,8 @@ def _env_opcional(nome: str, padrao: str = "") -> str:
     return os.environ.get(nome, padrao).strip()
 
 
-SUPABASE_URL = _env_obrigatoria("https://jkhryhweclvoqwanbenc.supabase.co/rest/v1/")
-SUPABASE_KEY = _env_obrigatoria("sb_publishable_Scn8K2OK6SXd9eRts85YHg_U0oQ8Knr", minimo=40)
+SUPABASE_URL = _env_obrigatoria("SUPABASE_URL")
+SUPABASE_KEY = _env_obrigatoria("SUPABASE_KEY", minimo=40)
 TEMPO_SESSAO_MIN = int(_env_opcional("SOS_SESSAO_MIN", "60"))
 
 
