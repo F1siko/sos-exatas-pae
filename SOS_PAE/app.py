@@ -4,13 +4,13 @@ Execução:
     streamlit run app_sos_exatas.py
 
 Variáveis de ambiente OBRIGATÓRIAS (o app NÃO inicia se faltar qualquer uma):
-    SUPABASE_URL         — URL do projeto Supabase (SEM /rest/v1/ no final)
-    SUPABASE_KEY         — Chave `service_role` rotacionada do Supabase (NUNCA commitar)
+    SUPABASE_URL        — URL do projeto Supabase (SEM /rest/v1/ no final)
+    SUPABASE_KEY        — Chave `service_role` rotacionada do Supabase (NUNCA commitar)
     SOS_SENHA_INICIAL    — Senha inicial dos usuários padrão (troca obrigatória
-                           no primeiro acesso). Deve ter ≥12 caracteres.
+                        no primeiro acesso). Deve ter ≥12 caracteres.
 
 Variáveis opcionais:
-    SOS_LOG_LEVEL        — DEBUG | INFO | WARNING | ERROR (padrão: INFO)
+    SOS_LOG_LEVEL       — DEBUG | INFO | WARNING | ERROR (padrão: INFO)
     SOS_SESSAO_MIN       — minutos de inatividade até expirar a sessão (padrão: 60)
 """
 from __future__ import annotations
@@ -30,6 +30,8 @@ from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from html import escape as esc
 from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()
 from typing import Optional
 from xml.sax.saxutils import escape as xml_esc
 
@@ -42,7 +44,6 @@ from supabase import create_client, Client
 # Configuração de logging estruturado (JSON)
 # ---------------------------------------------------------------------------
 _LOG_LEVEL = os.environ.get("SOS_LOG_LEVEL", "INFO").upper()
-
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record):
@@ -274,7 +275,7 @@ PERMISSOES = {
     Perfil.ALUNO: {"visualizar", "enviar_material", "responder_diario"},
     Perfil.PROFESSOR: _BASE_PROF,
     Perfil.COORDENADOR: (_BASE_PROF - {"excluir"}) | {"gerenciar_matriz", "matricular",
-                                                     "cadastrar_professor", "gerenciar_usuarios", "gerenciar_agenda", "gerenciar_contratos"},
+                                                   "cadastrar_professor", "gerenciar_usuarios", "gerenciar_agenda", "gerenciar_contratos"},
     Perfil.ADMIN: _BASE_PROF | {"gerenciar_matriz", "matricular", "cadastrar_professor",
                                 "gerenciar_usuarios", "excluir_aluno", "auditoria", "editar_diretorio", "gerenciar_agenda", "gerenciar_contratos"},
 }
@@ -998,11 +999,12 @@ def view_material_oficial(aluno, perfil, usuario):
     k[2].metric("☁️ Armazenamento", "Supabase Storage (100% Persistente)")
     st.markdown("---")
 
-    abas_nomes = ["🔍 Biblioteca de Materiais"]
-    if pode(perfil, "criar"):
-        abas_nomes.append("➕ Cadastrar Novo Material")
+    tem_permissao_criar = pode(perfil, "criar")
 
-    abas = st.tabs(abas_nomes)
+    if tem_permissao_criar:
+        abas = st.tabs(["🔍 Biblioteca de Materiais", "➕ Cadastrar Novo Material"])
+    else:
+        abas = [st.container()]
 
     with abas[0]:
         st.markdown("### 🔍 Buscar Materiais na Nuvem")
@@ -1053,7 +1055,7 @@ def view_material_oficial(aluno, perfil, usuario):
                 except Exception as e:
                     st.error(f"Erro ao gerar link de download: {e}")
 
-    if pode(perfil, "criar") and len(abas) > 1:
+    if tem_permissao_criar and len(abas) > 1:
         with abas[1]:
             st.markdown("### ➕ Cadastrar Novo Material na Nuvem")
             with st.form("form_material_nuvem", clear_on_submit=True):
@@ -1813,7 +1815,7 @@ def view_diario(aluno, perfil, usuario):
     with st.form("form_diario", clear_on_submit=True):
         tarefa = st.text_input("Qual lista ou ficha você resolveu hoje?")
         sent = st.select_slider("Como você se sentiu?", ["Muito travado / Inseguro", "Com dúvidas, mas tentei",
-                                                         "Confiante na maioria", "Pleno domínio"])
+                                                        "Confiante na maioria", "Pleno domínio"])
         aten = st.number_input("Erros por pura distração:", 0, 20, 1)
         res = st.text_area("Onde você travou e precisou ver a resolução?")
         duv = st.text_area("Pergunta para o professor responder na aula:")
@@ -1982,7 +1984,7 @@ def view_docs_coord(aluno, perfil, usuario):
             else:
                 nome = salvar_upload(arq, PASTA_DOCS_PROFESSORES, "DOC") if arq else None
                 DB()["docs_professores"].append({"data": str(date.today()), "professor": rem, "assunto": assunto.strip(),
-                                                 "descricao": det, "arquivo": nome})
+                                               "descricao": det, "arquivo": nome})
                 _salvar_e_recarregar("Documento enviado!")
 
 
@@ -2061,7 +2063,7 @@ def view_produtividade(aluno, perfil, usuario):
     st.title("Produtividade da Equipe Pedagógica")
     rows = []
     for p in DB().get("professores", []):
-        ats = [s for al in DB()["alunos"].values() for s in al.get("atendimentos_processo", []) if s.get("professor") == p["nome"]]
+        ats = [s for al in DB()["alunos"].values() for s in al.get("atendimentos_processo", []) if s.get("professor"] == p["nome"]]
         h = sum(s.get("duracao_h", 1.5) for s in ats)
         rows.append({"Professor": p["nome"], "Disciplina": p["disciplina"], "Aulas": len(ats),
                      "Horas": round(h, 2), "Repasse Estimado (R$)": round(h * p.get("valor_hora", 90), 2)})
@@ -2152,7 +2154,7 @@ def view_usuarios(aluno, perfil, usuario):
                 if not (log_in and nom.strip()):
                     st.error("Preencha login e nome.")
                 elif log_in in users:
-                    st.error("Este login já existe.")
+                    st.error(" Este login já existe.")
                 elif erro:
                     st.error(erro)
                 elif prf in ("aluno", "familia") and not vnc:
