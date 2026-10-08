@@ -1670,33 +1670,32 @@ def view_upload_fichas(aluno, perfil, usuario):
     materiais_nuvem = mat_listar_nuvem()
     
     with st.form("form_upload_ficha", clear_on_submit=True):
-        origem = st.radio("Origem da Ficha:", ["Fazer Upload de Novo Arquivo", "Selecionar do Material Oficial (Nuvem)"], horizontal=True)
+        origem = st.radio("Origem da Ficha:", ["Fazer Upload do Computador", "Selecionar da Biblioteca (Material Oficial)"], horizontal=True)
         
         profs = [p["nome"] for p in DB()["professores"]]
         resp = st.selectbox("Professor Responsável:", profs, index=profs.index(usuario["nome"]) if usuario["nome"] in profs else 0)
         
-        if origem == "Fazer Upload de Novo Arquivo":
+        material_selecionado = None
+        arq = None
+        tit = ""
+        
+        if origem == "Fazer Upload do Computador":
             tit = st.text_input("Título da Ficha")
             arq = st.file_uploader("Arquivo PDF:", type=["pdf", "docx", "doc", "xlsx", "pptx", "png", "jpg", "jpeg", "zip"])
-            material_selecionado = None
         else:
             if not materiais_nuvem:
-                st.warning("Nenhum material cadastrado no Material Oficial ainda.")
-                material_selecionado = None
-                tit = ""
-                arq = None
+                st.warning("📭 Nenhum material cadastrado na Biblioteca Oficial ainda.")
             else:
-                mat_escolhido = st.selectbox(
-                    "Selecione o material do banco de dados:",
+                material_selecionado = st.selectbox(
+                    "Selecione o material da biblioteca:",
                     materiais_nuvem,
                     format_func=lambda m: f"{m['titulo']} ({m['disciplina']} • {m['serie']} — {m['tipo']})"
                 )
-                material_selecionado = mat_escolhido
-                tit = mat_escolhido["titulo"] if mat_escolhido else ""
-                arq = None
-                
+                if material_selecionado:
+                    tit = material_selecionado["titulo"]
+                    
         if st.form_submit_button("Publicar Ficha para o Aluno"):
-            if origem == "Fazer Upload de Novo Arquivo":
+            if origem == "Fazer Upload do Computador":
                 if tit.strip() and arq:
                     nome = salvar_upload(arq, PASTA_FICHAS, d["id"])
                     aluno["fichas_disponibilizadas"].append({
@@ -1723,9 +1722,9 @@ def view_upload_fichas(aluno, perfil, usuario):
                     })
                     notificar(d["id"], "📄 Nova ficha disponível", material_selecionado["titulo"], origem="professor")
                     auditar("ficha_publicada_nuvem", f"{d['id']} {material_selecionado['titulo']}")
-                    _salvar_e_recarregar("Ficha do Material Oficial vinculada com sucesso!")
+                    _salvar_e_recarregar("Ficha da Biblioteca vinculada com sucesso!")
                 else:
-                    st.error("Selecione um material válido do banco de dados.")
+                    st.error("Selecione um material válido da biblioteca.")
 
 
 def view_fichas_aluno(aluno, perfil, usuario):
