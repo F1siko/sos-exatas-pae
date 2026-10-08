@@ -1,7 +1,6 @@
-streamlit
-pandas
-plotly
-openpyxl
-reportlab
-supabase
-httpx
+streamlit>=1.30.0
+supabase>=2.0.0
+pandas>=2.0.0
+plotly>=5.0.0
+openpyxl>=3.1.0
+reportlab>=4.0.0
