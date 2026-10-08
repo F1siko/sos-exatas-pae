@@ -1,17 +1,94 @@
-"""SOS Exatas — Sistema Integrado PAE (Conectado ao Supabase & Blindado).
+"""SOS Exatas — Sistema Integrado PAE (Blindado + Supabase).
 
 Execução:
-    streamlit run app_sos_exatas.py
+    streamlit run app.py
 
-Variáveis de ambiente OBRIGATÓRIAS (o app NÃO inicia se faltar qualquer uma):
+Secrets/Variáveis OBRIGATÓRIAS (o app NÃO inicia se faltar):
     SUPABASE_URL        — URL do projeto Supabase (SEM /rest/v1/ no final)
-    SUPABASE_KEY        — Chave `service_role` rotacionada do Supabase (NUNCA commitar)
-    SOS_SENHA_INICIAL    — Senha inicial dos usuários padrão (troca obrigatória
-                        no primeiro acesso). Deve ter ≥12 caracteres.
+    SUPABASE_KEY        — Chave service_role rotacionada
+    SOS_SENHA_INICIAL   — Senha inicial (≥12 caracteres)
 
-Variáveis opcionais:
+Opcionais:
     SOS_LOG_LEVEL       — DEBUG | INFO | WARNING | ERROR (padrão: INFO)
-    SOS_SESSAO_MIN       — minutos de inatividade até expirar a sessão (padrão: 60)
+    SOS_SESSAO_MIN      — minutos até expirar a sessão (padrão: 60)
+
+-----------------------------------------------------------------------------
+MIGRAÇÕES SQL — rodar UMA VEZ no SQL Editor do Supabase:
+
+    ALTER TABLE public.sistema_estado
+      ADD COLUMN IF NOT EXISTS versao INTEGER NOT NULL DEFAULT 0;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_estado_global_id
+      ON public.sistema_estado (id);
+
+    CREATE TABLE IF NOT EXISTS public.auditoria (
+      id BIGSERIAL PRIMARY KEY,
+      quando TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      usuario TEXT,
+      acao TEXT NOT NULL,
+      detalhe TEXT DEFAULT '',
+      valor_antes TEXT,
+      valor_depois TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_aud_usuario ON public.auditoria (usuario, quando DESC);
+    CREATE INDEX IF NOT EXISTS idx_aud_acao ON public.auditoria (acao, quando DESC);
+
+    CREATE TABLE IF NOT EXISTS public.notificacoes (
+      id BIGSERIAL PRIMARY KEY,
+      aluno_id TEXT NOT NULL,
+      titulo TEXT NOT NULL,
+      mensagem TEXT NOT NULL DEFAULT '',
+      tipo TEXT NOT NULL DEFAULT 'info',
+      lida BOOLEAN NOT NULL DEFAULT FALSE,
+      origem TEXT NOT NULL DEFAULT 'sistema',
+      criada_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_notif_aluno ON public.notificacoes (aluno_id, criada_em DESC);
+    CREATE INDEX IF NOT EXISTS idx_notif_naolida ON public.notificacoes (aluno_id) WHERE lida = FALSE;
+
+    CREATE TABLE IF NOT EXISTS public.notas (
+      id BIGSERIAL PRIMARY KEY,
+      aluno_id TEXT NOT NULL,
+      disciplina TEXT NOT NULL,
+      periodo TEXT NOT NULL,
+      avaliacao TEXT NOT NULL,
+      nota NUMERIC NOT NULL CHECK (nota >= 0 AND nota <= 10),
+      peso NUMERIC NOT NULL DEFAULT 1.0 CHECK (peso > 0),
+      lancada_por TEXT,
+      lancada_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_notas_aluno ON public.notas (aluno_id, disciplina, periodo);
+
+    CREATE TABLE IF NOT EXISTS public.professor_aluno (
+      professor_login TEXT NOT NULL,
+      aluno_id TEXT NOT NULL,
+      ativo BOOLEAN NOT NULL DEFAULT TRUE,
+      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (professor_login, aluno_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS public.materiais_oficiais (
+      id BIGSERIAL PRIMARY KEY,
+      titulo TEXT NOT NULL,
+      descricao TEXT DEFAULT '',
+      disciplina TEXT NOT NULL,
+      serie TEXT NOT NULL,
+      tipo TEXT NOT NULL,
+      modulo TEXT DEFAULT '',
+      tags TEXT DEFAULT '',
+      autor TEXT DEFAULT '',
+      versao TEXT DEFAULT '1.0',
+      file_path TEXT NOT NULL,
+      file_size_kb NUMERIC DEFAULT 0,
+      file_ext TEXT DEFAULT '',
+      criado_por TEXT DEFAULT '',
+      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    INSERT INTO storage.buckets (id, name, public)
+    VALUES ('materiais_oficiais', 'materiais_oficiais', TRUE)
+    ON CONFLICT (id) DO NOTHING;
+-----------------------------------------------------------------------------
 """
 from __future__ import annotations
 
@@ -25,7 +102,7 @@ import re
 import secrets
 import sys
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from html import escape as esc
@@ -39,9 +116,47 @@ import streamlit as st
 from supabase import create_client, Client
 
 # ---------------------------------------------------------------------------
-# Configuração de logging estruturado (JSON)
+# st.set_page_config PRIMEIRO
 # ---------------------------------------------------------------------------
-_LOG_LEVEL = os.environ.get("SOS_LOG_LEVEL", "INFO").upper()
+st.set_page_config(
+    page_title="SOS Exatas — Sistema Integrado PAE",
+    page_icon="🧭",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ---------------------------------------------------------------------------
+# Leitura de secrets/env
+# ---------------------------------------------------------------------------
+def _ler_segredo(nome: str) -> str:
+    valor = os.environ.get(nome, "").strip()
+    if valor:
+        return valor
+    try:
+        return str(st.secrets.get(nome, "")).strip()
+    except Exception:
+        return ""
+
+
+def _env_obrigatoria(nome: str, minimo: int = 1) -> str:
+    valor = _ler_segredo(nome)
+    if not valor:
+        raise RuntimeError(
+            f"Variável/secrets obrigatório ausente: {nome}. "
+            f"O app não inicia sem ela (fail-closed)."
+        )
+    if len(valor) < minimo:
+        raise RuntimeError(f"{nome} tem menos de {minimo} caracteres.")
+    return valor
+
+
+def _env_opcional(nome: str, padrao: str = "") -> str:
+    return _ler_segredo(nome) or padrao
+
+
+_LOG_LEVEL = (_ler_segredo("SOS_LOG_LEVEL") or "INFO").upper()
+
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record):
@@ -60,31 +175,14 @@ _handler = logging.StreamHandler(sys.stderr)
 _handler.setFormatter(_JsonFormatter())
 logging.basicConfig(level=getattr(logging, _LOG_LEVEL, logging.INFO), handlers=[_handler])
 log = logging.getLogger("sos_exatas")
-
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-# ---------------------------------------------------------------------------
-# Helpers de configuração — fail-closed
-# ---------------------------------------------------------------------------
-def _env_obrigatoria(nome: str, minimo: int = 1) -> str:
-    valor = os.environ.get(nome, "").strip()
-    if not valor:
-        raise RuntimeError(
-            f"Variável de ambiente obrigatória ausente: {nome}. "
-            f"O app não inicia sem ela (fail-closed)."
-        )
-    if len(valor) < minimo:
-        raise RuntimeError(f"{nome} tem menos de {minimo} caracteres.")
-    return valor
+SUPABASE_URL = _env_obrigatoria("SUPABASE_URL").rstrip("/")
+if SUPABASE_URL.endswith("/rest/v1"):
+    SUPABASE_URL = SUPABASE_URL[: -len("/rest/v1")]
 
-
-def _env_opcional(nome: str, padrao: str = "") -> str:
-    return os.environ.get(nome, padrao).strip()
-
-
-SUPABASE_URL = _env_obrigatoria("SUPABASE_URL")
 SUPABASE_KEY = _env_obrigatoria("SUPABASE_KEY", minimo=40)
 TEMPO_SESSAO_MIN = int(_env_opcional("SOS_SESSAO_MIN", "60"))
 
@@ -94,14 +192,7 @@ def _senha_inicial() -> str:
 
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-log.info("Supabase client criado com sucesso")
-
-st.set_page_config(
-    page_title="SOS Exatas — Sistema Integrado PAE",
-    page_icon="🧭",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+log.info(f"Supabase client criado para {SUPABASE_URL}")
 
 
 def _versao_st() -> tuple:
@@ -137,16 +228,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==============================================================================
-# DIRETÓRIOS E CONSTANTES
+# CONSTANTES
 # ==============================================================================
 PASTA_FICHAS = "fichas_professores"
 PASTA_ENVIOS_ALUNOS = "envios_alunos"
 PASTA_DOCS_PROFESSORES = "docs_professores"
-NOTIF_DIR = Path("dados/notificacoes")
-NOTAS_DIR = Path("dados/notas")
 
-for _p in [PASTA_FICHAS, PASTA_ENVIOS_ALUNOS, PASTA_DOCS_PROFESSORES,
-           NOTIF_DIR, NOTAS_DIR]:
+for _p in [PASTA_FICHAS, PASTA_ENVIOS_ALUNOS, PASTA_DOCS_PROFESSORES]:
     os.makedirs(_p, exist_ok=True)
 
 MAX_FALHAS = 5
@@ -155,12 +243,24 @@ BLOQUEIO_MIN = 5
 MODALIDADES_VALIDAS = [
     "Mentoria Acadêmica Presencial",
     "Mentoria Acadêmica Virtual",
-    "Banca de Estudos"
+    "Banca de Estudos",
 ]
+
+# Limites de upload
+MAX_UPLOAD_MB = 20
+LIMITE_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+_MAGIC = {
+    "pdf": [b"%PDF-"],
+    "png": [b"\x89PNG\r\n\x1a\n"],
+    "jpg": [b"\xff\xd8\xff"],
+    "jpeg": [b"\xff\xd8\xff"],
+    "zip": [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"],
+}
 
 
 # ==============================================================================
-# ENUMS E CONSTANTES PEDAGÓGICAS
+# ENUMS
 # ==============================================================================
 class Disciplina(str, Enum):
     MATEMATICA = "Matemática"
@@ -223,12 +323,12 @@ TOPICOS_SOS: dict[str, TopicoSOS] = {
 TAXONOMIA_ERRO_PEDAGOGICO: list[str] = [
     "Interpretação", "Modelagem", "Cálculo", "Álgebra básica",
     "Distração", "Lacuna conceitual", "Memorização frágil",
-    "Falta de pré-requisito", "Estratégia inadequada", "Gestão de tempo"
+    "Falta de pré-requisito", "Estratégia inadequada", "Gestão de tempo",
 ]
 
 
 # ==============================================================================
-# UTILITÁRIOS DE SEGURANÇA
+# SEGURANÇA
 # ==============================================================================
 def nome_seguro(nome: str) -> str:
     return re.sub(r"[^\w.\-]", "_", Path(nome).name)[:120] or "arquivo"
@@ -258,6 +358,24 @@ def senha_valida(senha: str) -> Optional[str]:
     return None
 
 
+def validar_upload_magic(arquivo) -> Optional[str]:
+    """Valida tamanho + assinatura. Retorna msg de erro ou None."""
+    if arquivo is None:
+        return "Nenhum arquivo enviado."
+    if arquivo.size > LIMITE_UPLOAD_BYTES:
+        return f"Arquivo excede o limite de {MAX_UPLOAD_MB} MB."
+    ext = Path(arquivo.name).suffix.lower().lstrip(".")
+    if ext in ("docx", "xlsx", "pptx"):
+        ext = "zip"
+    assinaturas = _MAGIC.get(ext)
+    if not assinaturas:
+        return None
+    cabecalho = arquivo.getvalue()[:8]
+    if not any(cabecalho.startswith(a) for a in assinaturas):
+        return f"Conteúdo do arquivo não corresponde à extensão .{ext}."
+    return None
+
+
 class Perfil(str, Enum):
     FAMILIA = "familia"
     ALUNO = "aluno"
@@ -266,16 +384,22 @@ class Perfil(str, Enum):
     ADMIN = "admin"
 
 
-_BASE_PROF = {"visualizar", "criar", "editar", "excluir", "anexar", "exportar", "comentar",
-              "notificar", "lancar_atendimento", "gerenciar_agenda", "gerenciar_contratos"}
+_BASE_PROF = {"visualizar", "criar", "editar", "excluir", "anexar", "exportar",
+              "comentar", "notificar", "lancar_atendimento",
+              "gerenciar_agenda", "gerenciar_contratos"}
 PERMISSOES = {
     Perfil.FAMILIA: {"visualizar", "exportar", "comentar"},
     Perfil.ALUNO: {"visualizar", "enviar_material", "responder_diario"},
     Perfil.PROFESSOR: _BASE_PROF,
-    Perfil.COORDENADOR: (_BASE_PROF - {"excluir"}) | {"gerenciar_matriz", "matricular",
-                                                   "cadastrar_professor", "gerenciar_usuarios", "gerenciar_agenda", "gerenciar_contratos"},
-    Perfil.ADMIN: _BASE_PROF | {"gerenciar_matriz", "matricular", "cadastrar_professor",
-                                "gerenciar_usuarios", "excluir_aluno", "auditoria", "editar_diretorio", "gerenciar_agenda", "gerenciar_contratos"},
+    Perfil.COORDENADOR: (_BASE_PROF - {"excluir"}) | {
+        "gerenciar_matriz", "matricular", "cadastrar_professor",
+        "gerenciar_usuarios", "gerenciar_agenda", "gerenciar_contratos",
+    },
+    Perfil.ADMIN: _BASE_PROF | {
+        "gerenciar_matriz", "matricular", "cadastrar_professor",
+        "gerenciar_usuarios", "excluir_aluno", "auditoria",
+        "editar_diretorio", "gerenciar_agenda", "gerenciar_contratos",
+    },
 }
 
 
@@ -295,7 +419,7 @@ def exigir(perfil, acao: str) -> None:
 
 
 # ==============================================================================
-# HELPERS DE UI E ARQUIVOS
+# HELPERS UI
 # ==============================================================================
 def card(classe_css: str, html_conteudo: str) -> None:
     st.markdown(f'<div class="{classe_css}">{html_conteudo}</div>', unsafe_allow_html=True)
@@ -316,91 +440,12 @@ def botao_download(label: str, pasta: str | Path, nome_arquivo: str, key: str) -
     if not caminho.exists():
         st.warning(f"⚠️ Arquivo indisponível: {nome_arquivo}")
         return
-    st.download_button(
-        label,
-        data=caminho.read_bytes(),
-        file_name=nome_arquivo,
-        key=key,
-        **W,
-    )
+    st.download_button(label, data=caminho.read_bytes(),
+                       file_name=nome_arquivo, key=key, **W)
 
 
 # ==============================================================================
-# HELPERS DE CONFIGURAÇÃO / PEDAGÓGICOS
-# ==============================================================================
-def periodos_disponiveis(aluno: Optional[dict] = None) -> list[str]:
-    base = list(DB()["config"].get("periodos", []))
-    if aluno:
-        for p in aluno.get("planejamentos_pedagogicos", []):
-            per = p.get("periodo")
-            if per and per not in base:
-                base.append(per)
-    return base
-
-
-def disciplinas_disponiveis() -> list[str]:
-    return list(DB()["config"].get("disciplinas", []))
-
-
-def parecer_automatico(aluno: dict) -> str:
-    d = aluno.get("dados", {})
-    op = aluno.get("operacao", {})
-    ats = aluno.get("atendimentos_processo", [])
-    ciclos = aluno.get("ciclos_intervencao", [])
-    fechados = sum(1 for c in ciclos if "Fechado" in str(c.get("status", "")))
-    abertos = sum(1 for c in ciclos if "Fechado" not in str(c.get("status", "")))
-
-    if ats:
-        ganhos = [float(a.get("ganho_ipsativo", 0) or 0) for a in ats]
-        media_ganho = sum(ganhos) / len(ganhos)
-    else:
-        media_ganho = 0.0
-
-    if media_ganho >= 15:
-        recomendacao = "Recomenda-se manter o ritmo atual e reforçar a revisão espaçada D+7/D+30."
-    elif media_ganho > 0:
-        recomendacao = "Recomenda-se consolidar as habilidades-foco com listas estruturantes adicionais."
-    else:
-        recomendacao = "Recomenda-se revisar pré-requisitos e redesenhar a abordagem didática dos blocos com maior dificuldade."
-
-    return (
-        f"{d.get('nome', 'O(A) estudante')} cumpriu "
-        f"{op.get('horas_realizadas', 0):.1f}h de {op.get('horas_contratadas', 0):.1f}h contratadas, "
-        f"com {op.get('presencas', 0)} presença(s) e {op.get('faltas', 0)} falta(s). "
-        f"Foram registrados {len(ats)} atendimento(s), com ganho ipsativo médio de "
-        f"{media_ganho:+.1f} p.p. por sessão. Ciclos fechados com sucesso: {fechados}; "
-        f"em andamento: {abertos}. {recomendacao}"
-    )
-
-
-def renderizar_widget_notificacoes(aluno_id: str) -> None:
-    notifs = carregar_notificacoes(aluno_id)
-    if not notifs:
-        return
-
-    nao_lidas = sum(1 for n in notifs if not n.get("lida"))
-    with st.popover(f"🔔 Notificações ({nao_lidas} não lida(s))"):
-        c1, c2 = st.columns([3, 1])
-        c1.markdown(f"**{len(notifs)} notificação(ões) no total**")
-        if nao_lidas and c2.button("Marcar todas como lidas", key=f"mtl_{aluno_id}"):
-            marcar_todas_lidas(aluno_id)
-            st.rerun()
-
-        icones = {"sucesso": "✅", "info": "ℹ️", "alerta": "⚠️", "erro": "❌"}
-        for i, n in enumerate(notifs[:20]):
-            icone = icones.get(n.get("tipo"), "🔔")
-            estado = "" if n.get("lida") else " **(nova)**"
-            with st.container(border=True):
-                st.markdown(f"{icone} **{esc(n.get('titulo', ''))}**{estado}")
-                st.caption(f"{str(n.get('criada_em', ''))[:16]} • origem: {esc(n.get('origem', 'sistema'))}")
-                st.write(esc(str(n.get("mensagem", ""))))
-                if not n.get("lida") and st.button("Marcar como lida", key=f"ml_{aluno_id}_{i}"):
-                    marcar_como_lida(aluno_id, i)
-                    st.rerun()
-
-
-# ==============================================================================
-# BANCO DE DADOS (SUPABASE CLOUD + VERSIONAMENTO OTIMISTA)
+# BANCO — helpers de estado
 # ==============================================================================
 _VERSAO_ESTADO = "versao"
 
@@ -429,133 +474,30 @@ HABILIDADES_PADRAO = [
 ]
 
 
-def _gerar_alunos_base_sos() -> dict:
-    presenciais = [
-        "Amanda Helena Silva Freire", "Beatriz Lima Figueiredo de Sá",
-        "Caio Tolentino De Lira Alves Paz", "Daniel Brandt de Sampaio",
-        "Davi Batista Ferreira da Silva Mousinho", "Gabriel Rodrigues Lacerda",
-        "Helena Arruda Melo da Costa e Silva", "Isaac Menezes de Araújo",
-        "João Gabriel Bispo Oliveira", "Larissa Maria Samico Cunha",
-        "Laura Pinto Gusmão Paes", "Lucas Gabriel Sampaio Interaminense de Oliveira",
-        "Lucas Peralta Gois", "Luiza Lessa Rocha", "Manoel Albuquerque",
-        "Marco Antonio Gonçalves Pereira", "Maria da Conceição Pereira de Freitas",
-        "Maria Luisa da Silva Lima", "Maria Luiza Araujo", "Maria Victoria Martins de Melo",
-        "Marianna Carreras de Carvalho", "Marina da Franca Bandeira Ferreira Santos",
-        "Matheus Felipe Alves da Silva", "Romero Alencar de Mendonça Canuto Filho",
-        "Sara Lessa Rocha", "Sofia Gomes Silva", "Vinícius Macedo Quirino da Silva",
-        "Yasmin Silva Lima", "Gabriela Bezerra Porto Carreiro", "Marília Diniz Manguinho"
-    ]
-    virtuais = [
-        "Maria Júlia da Silva Lima", "Ryan Souza Duarte Teixeira",
-        "Carolina Cavalcanti Santos", "Rodrigo Menezes Breckenfeld",
-        "Theo Manasses Xavier Rodrigues", "José Guilherme Carneiro do Nascimento",
-        "Isabela Evelly Nabu Santiago da Silva"
-    ]
-    banca = [
-        "Caio Tolentino De Lira Alves Paz", "Helena Arruda Melo da Costa e Silva",
-        "Gabriel Rodrigues Lacerda", "Marina da Franca Bandeira Ferreira Santos",
-        "Lukas Dekian Barbosa Silva dos Santos", "Guilherme de Moura Falcão",
-        "Gabriel de Moura Falcão", "Raul Alves de Azevedo", "Davi Suassuna West",
-        "Beatriz Pires Campaner", "Elis Batista Jansen de Sá Cruz",
-        "Maria Eduarda da Silva Gomes", "Heloísa Lisboa Kyrillos",
-        "Ester Ferreira Ribeiro Costa Vanderlei", "Beatriz Nunes da Costa Simões",
-        "Theo Manasses Xavier Rodrigues", "Vittor Madeira Costa de Amorim",
-        "Eduarda Meireles Rodrigues", "Max André Albuquerque Cavalcante",
-        "Laura Limeira de Moura Ramos", "Miguel de Lima Oliveira",
-        "Vinicius da Franca Bandeira Ferreira Santos", "Ana Miranda de Alcântara Leite",
-        "Marília Diniz Manguinho"
-    ]
-
-    todos_nomes = sorted(list(set(presenciais + virtuais + banca)))
-    alunos_db = {}
-    for idx, nome in enumerate(todos_nomes, start=101):
-        aid = f"ALU-{idx}"
-        mods = []
-        if nome in presenciais:
-            mods.append("Mentoria Acadêmica Presencial")
-        if nome in virtuais:
-            mods.append("Mentoria Acadêmica Virtual")
-        if nome in banca:
-            mods.append("Banca de Estudos")
-
-        alunos_db[aid] = {
-            "dados": {
-                "id": aid,
-                "nome": nome,
-                "modalidade": mods[0] if mods else "Mentoria Acadêmica Presencial",
-                "modalidades": mods,
-                "escola": "Colégio de Aplicação / Geral",
-                "serie": "3º Ano EM / Pré-Vestibular",
-                "objetivo_estudante": "Medicina (SSA/UPE e ENEM)",
-                "contato": "(81) 98888-0000",
-                "responsaveis": f"Responsável por {nome}",
-                "data_matricula": "2026-02-01",
-                "foto_path": None,
-                "banca_foco": "SSA/UPE (Medicina)"
-            },
-            "operacao": {
-                "horas_contratadas": 40.0,
-                "horas_realizadas": 12.0,
-                "valor_hora_contrato": 130.0,
-                "presencas": 8,
-                "faltas": 0
-            },
-            "contratos": [
-                {
-                    "id": f"CONT-{idx}",
-                    "numero_contrato": f"SOS-2026-{idx}",
-                    "data_inicio": "2026-02-01",
-                    "data_fim": "2026-12-15",
-                    "status": "Vigente",
-                    "valor_total": 5200.0,
-                    "forma_pagamento": "Boleto / Pix Mensal",
-                    "observacoes": "Contrato padrão PAE anual."
-                }
-            ],
-            "parecer_coordenacao": "",
-            "planejamentos_pedagogicos": [],
-            "fichas_disponibilizadas": [],
-            "materiais_enviados_aluno": [],
-            "atendimentos_processo": [],
-            "ciclos_intervencao": [],
-            "autoavaliacoes_estudante": [],
-            "revisoes_agendadas": []
-        }
-    return alunos_db
-
-
 def _template_banco() -> dict:
     return {
         _VERSAO_ESTADO: 0,
         "usuarios": {},
         "config": {
-            "periodos": ["2026 - 1º Bimestre", "2026 - 2º Bimestre", "2026 - 3º Bimestre",
-                         "2026 - 4º Bimestre", "Outubro/2026"],
-            "disciplinas": ["Física", "Matemática", "Química", "Biologia", "Ciências", "Redação"],
+            "periodos": ["2026 - 1º Bimestre", "2026 - 2º Bimestre",
+                         "2026 - 3º Bimestre", "2026 - 4º Bimestre", "Outubro/2026"],
+            "disciplinas": ["Física", "Matemática", "Química",
+                            "Biologia", "Ciências", "Redação"],
         },
         "bloqueios": {},
-        "auditoria": [],
-        "agenda": [
-            {
-                "id": "AG-001",
-                "titulo": "Mentoria Coletiva de Física - Termodinâmica",
-                "data": "2026-10-10",
-                "horario": "14:00",
-                "local_ou_link": "Sala Presencial 01 / Sede Graças",
-                "responsavel": "Prof. Heitor Albuquerque",
-                "tipo": "Aula Coletiva",
-                "participantes": "Turma 3º Ano EM"
-            }
-        ],
+        "agenda": [],
         "professores": [
-            {"id": "PROF-01", "nome": "Prof. Heitor Albuquerque", "disciplina": "Física", "valor_hora": 90.0, "contato": "(81) 99988-7766"},
-            {"id": "PROF-02", "nome": "Prof. Ésio Tavares", "disciplina": "Química", "valor_hora": 90.0, "contato": "(81) 98877-5544"},
-            {"id": "PROF-03", "nome": "Prof. Lucas Mendes", "disciplina": "Matemática", "valor_hora": 75.0, "contato": "(81) 97766-3322"},
+            {"id": "PROF-01", "nome": "Prof. Heitor Albuquerque", "disciplina": "Física",
+             "valor_hora": 90.0, "contato": "(81) 99988-7766"},
+            {"id": "PROF-02", "nome": "Prof. Ésio Tavares", "disciplina": "Química",
+             "valor_hora": 90.0, "contato": "(81) 98877-5544"},
+            {"id": "PROF-03", "nome": "Prof. Lucas Mendes", "disciplina": "Matemática",
+             "valor_hora": 75.0, "contato": "(81) 97766-3322"},
         ],
         "habilidades_cadastradas": HABILIDADES_PADRAO,
         "mensagens_familias": [],
         "docs_professores": [],
-        "alunos": _gerar_alunos_base_sos(),
+        "alunos": {},
     }
 
 
@@ -564,27 +506,22 @@ def criar_banco_padrao() -> dict:
     h = gerar_hash(_senha_inicial())
 
     def usr(nome, perfil, vinc=None):
-        return {"nome": nome, "hash_senha": h, "perfil": perfil, "aluno_vinculado": vinc, "trocar_senha": True}
+        return {"nome": nome, "hash_senha": h, "perfil": perfil,
+                "aluno_vinculado": vinc, "trocar_senha": True}
 
     dados["usuarios"] = {
         "admin": usr("Administrador SOS Exatas", "admin"),
         "coordenacao": usr("Coordenação SOS Exatas", "coordenador"),
         "professor": usr("Prof. Heitor Albuquerque", "professor"),
-        "aluno": usr("Caio Tolentino (Aluno)", "aluno", "ALU-106"),
-        "familia": usr("Família Tolentino (Responsáveis)", "familia", "ALU-106"),
     }
-    dados["mensagens_familias"] = [
-        {"id": "MSG-000001", "data": "2026-09-28", "aluno_id": "ALU-106", "remetente": "Responsável por Caio Tolentino",
-         "mensagem": "Gostaria de alinhar o cronograma da mentoria com os simulados da escola.",
-         "respondida": False, "respostas": []}
-    ]
     return dados
 
 
 def sanitizar_banco(dados: dict) -> dict:
     padrao = _template_banco()
-    for k in ["usuarios", "professores", "alunos", "habilidades_cadastradas", "mensagens_familias",
-              "docs_professores", "config", "bloqueios", "auditoria", "agenda"]:
+    for k in ["usuarios", "professores", "alunos", "habilidades_cadastradas",
+              "mensagens_familias", "docs_professores", "config", "bloqueios",
+              "agenda"]:
         dados.setdefault(k, padrao[k])
     dados.setdefault(_VERSAO_ESTADO, 0)
     dados["config"].setdefault("periodos", padrao["config"]["periodos"])
@@ -597,17 +534,19 @@ def sanitizar_banco(dados: dict) -> dict:
         m.setdefault("respostas", [])
         m.setdefault("respondida", False)
 
-    if not dados.get("alunos") or len(dados["alunos"]) < 10:
-        dados["alunos"] = _gerar_alunos_base_sos()
+    # NUNCA regenerar alunos — só garantir tipo
+    if not isinstance(dados.get("alunos"), dict):
+        dados["alunos"] = {}
 
     for al in dados["alunos"].values():
         d = al.setdefault("dados", {})
         if "modalidades" not in d:
             d["modalidades"] = [d.get("modalidade", "Mentoria Acadêmica Presencial")]
-
         al.setdefault("contratos", [])
-        for k in ["planejamentos_pedagogicos", "fichas_disponibilizadas", "materiais_enviados_aluno",
-                  "ciclos_intervencao", "autoavaliacoes_estudante", "revisoes_agendadas", "atendimentos_processo"]:
+        for k in ["planejamentos_pedagogicos", "fichas_disponibilizadas",
+                  "materiais_enviados_aluno", "ciclos_intervencao",
+                  "autoavaliacoes_estudante", "revisoes_agendadas",
+                  "atendimentos_processo"]:
             al.setdefault(k, [])
         al.setdefault("parecer_coordenacao", "")
     return dados
@@ -620,40 +559,37 @@ def ciclos_vencidos(aluno: dict) -> list:
 
 
 class ConflitoDeVersao(RuntimeError):
-    """Levantada quando outra sessão gravou dados no Supabase concorrentemente."""
+    """Outra sessão gravou dados concorrentemente."""
 
 
 def salvar_banco(dados: Optional[dict] = None) -> None:
     dados = dados if dados is not None else st.session_state.db
-    versao_local = dados.get(_VERSAO_ESTADO, 0)
+    try:
+        versao_local = int(dados.get(_VERSAO_ESTADO, 0) or 0)
+    except (TypeError, ValueError):
+        versao_local = 0
     nova_versao = versao_local + 1
     dados[_VERSAO_ESTADO] = nova_versao
 
     payload = {
         "id": "estado_global",
         "dados": dados,
+        "versao": nova_versao,
         "atualizado_em": datetime.now(timezone.utc).isoformat(),
     }
-
     try:
-        if versao_local == 0:
-            resp = (
-                supabase.table("sistema_estado")
-                .update(payload)
-                .eq("id", "estado_global")
-                .execute()
-            )
-        else:
-            resp = (
-                supabase.table("sistema_estado")
-                .update(payload)
-                .eq("id", "estado_global")
-                .eq("dados->>versao", str(versao_local))
-                .execute()
-            )
+        resp = (
+            supabase.table("sistema_estado")
+            .update(payload)
+            .eq("id", "estado_global")
+            .eq("versao", versao_local)
+            .execute()
+        )
         if not resp.data:
             dados[_VERSAO_ESTADO] = versao_local
-            raise ConflitoDeVersao("Outra sessão atualizou os dados. Suas últimas alterações foram descartadas — refaça-as.")
+            raise ConflitoDeVersao(
+                "Outra sessão atualizou os dados. Refaça a última alteração."
+            )
         _carregar_banco_remoto.clear()
         log.info(f"Estado salvo versao={nova_versao}")
     except ConflitoDeVersao:
@@ -661,23 +597,21 @@ def salvar_banco(dados: Optional[dict] = None) -> None:
     except Exception as e:
         dados[_VERSAO_ESTADO] = versao_local
         log.error(f"Falha ao salvar no Supabase: {type(e).__name__}: {e}")
-        st.error("Não foi possível salvar os dados. Verifique sua conexão e tente novamente.")
+        st.error("Não foi possível salvar. Verifique a conexão.")
         raise
 
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=5, show_spinner=False)
 def _carregar_banco_remoto() -> Optional[dict]:
-    try:
-        resp = (
-            supabase.table("sistema_estado")
-            .select("dados")
-            .eq("id", "estado_global")
-            .execute()
-        )
-        if resp.data:
-            return resp.data[0]["dados"]
-    except Exception as e:
-        log.warning(f"Falha ao carregar do Supabase: {type(e).__name__}: {e}")
+    """None = registro ausente (bootstrap legítimo). Levanta em falha real."""
+    resp = (
+        supabase.table("sistema_estado")
+        .select("dados,versao")
+        .eq("id", "estado_global")
+        .execute()
+    )
+    if resp.data:
+        return resp.data[0]
     return None
 
 
@@ -685,32 +619,34 @@ def carregar_banco(forcar: bool = False) -> dict:
     if forcar:
         _carregar_banco_remoto.clear()
 
-    remoto = _carregar_banco_remoto()
-    if remoto:
-        dados = sanitizar_banco(remoto)
-        if _VERSAO_ESTADO not in remoto:
-            log.info("Migrando registro sem campo versao remoto")
-            try:
-                supabase.table("sistema_estado").update({
-                    "id": "estado_global",
-                    "dados": dados,
-                    "atualizado_em": datetime.now(timezone.utc).isoformat(),
-                }).eq("id", "estado_global").execute()
-                _carregar_banco_remoto.clear()
-            except Exception as e:
-                log.error(f"Falha na migração de versão: {type(e).__name__}: {e}")
+    try:
+        remoto = _carregar_banco_remoto()
+    except Exception as e:
+        raise RuntimeError(
+            f"Falha de conexão com o Supabase ao carregar o estado: {e}"
+        )
+
+    if remoto and isinstance(remoto, dict) and "dados" in remoto:
+        dados = sanitizar_banco(remoto["dados"])
+        try:
+            if remoto.get("versao") is not None:
+                dados[_VERSAO_ESTADO] = int(remoto["versao"])
+        except (TypeError, ValueError):
+            pass
         return dados
 
+    # Registro ausente → bootstrap idempotente
     dados = criar_banco_padrao()
     try:
-        supabase.table("sistema_estado").insert({
-            "id": "estado_global",
-            "dados": dados,
-            "atualizado_em": datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        supabase.table("sistema_estado").upsert(
+            {"id": "estado_global", "dados": dados, "versao": 0,
+             "atualizado_em": datetime.now(timezone.utc).isoformat()},
+            on_conflict="id",
+        ).execute()
         log.info("Bootstrap concluído no Supabase")
     except Exception as e:
-        log.error(f"Bootstrap falhou ao gravar no Supabase: {e}")
+        log.error(f"Bootstrap falhou: {e}")
+        raise
     return dados
 
 
@@ -740,19 +676,41 @@ def DB() -> dict:
     return st.session_state.db
 
 
-def auditar(acao: str, detalhe: str = "") -> None:
-    log_reg = DB().setdefault("auditoria", [])
-    log_reg.append({
-        "quando": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "usuario": st.session_state.get("usuario_key", "-"),
-        "acao": acao,
-        "detalhe": detalhe,
-    })
-    del log_reg[:-1000]
+# ==============================================================================
+# AUDITORIA — Postgres append-only
+# ==============================================================================
+def auditar(acao: str, detalhe: str = "",
+            valor_antes: str = "", valor_depois: str = "") -> None:
+    try:
+        supabase.table("auditoria").insert({
+            "usuario": st.session_state.get("usuario_key", "-"),
+            "acao": acao,
+            "detalhe": detalhe,
+            "valor_antes": valor_antes or None,
+            "valor_depois": valor_depois or None,
+        }).execute()
+    except Exception as e:
+        log.warning(f"Falha ao gravar auditoria: {type(e).__name__}: {e}")
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def _ler_auditoria(limite: int = 300) -> list:
+    try:
+        resp = (
+            supabase.table("auditoria")
+            .select("*")
+            .order("quando", desc=True)
+            .limit(limite)
+            .execute()
+        )
+        return resp.data or []
+    except Exception as e:
+        log.warning(f"Falha ao ler auditoria: {e}")
+        return []
 
 
 # ==============================================================================
-# NOTIFICAÇÕES & NOTAS
+# NOTIFICAÇÕES — Supabase
 # ==============================================================================
 @dataclass
 class Notificacao:
@@ -761,81 +719,183 @@ class Notificacao:
     mensagem: str
     tipo: str = "info"
     lida: bool = False
-    criada_em: str = field(default_factory=lambda: datetime.now().isoformat())
     origem: str = "sistema"
 
 
-def _ler_json(arq: Path) -> list:
-    if not arq.exists():
-        return []
+def carregar_notificacoes(aluno_id: str, limite: int = 100) -> list:
     try:
-        return json.loads(arq.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        resp = (
+            supabase.table("notificacoes")
+            .select("*")
+            .eq("aluno_id", aluno_id)
+            .order("criada_em", desc=True)
+            .limit(limite)
+            .execute()
+        )
+        return resp.data or []
+    except Exception as e:
+        log.warning(f"Falha ao carregar notificações: {e}")
         return []
-
-
-def _gravar_json(arq: Path, lista: list) -> None:
-    tmp = arq.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(lista, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, arq)
-
-
-def carregar_notificacoes(aluno_id: str) -> list:
-    return _ler_json(NOTIF_DIR / f"{aluno_id}.json")
-
-
-def _salvar_notif(aluno_id: str, lista: list) -> None:
-    _gravar_json(NOTIF_DIR / f"{aluno_id}.json", lista)
 
 
 def criar_notificacao(notif: Notificacao) -> None:
-    lista = carregar_notificacoes(notif.aluno_id)
-    lista.insert(0, asdict(notif))
-    _salvar_notif(notif.aluno_id, lista[:200])
+    try:
+        supabase.table("notificacoes").insert({
+            "aluno_id": notif.aluno_id,
+            "titulo": notif.titulo,
+            "mensagem": notif.mensagem,
+            "tipo": notif.tipo,
+            "lida": notif.lida,
+            "origem": notif.origem,
+        }).execute()
+    except Exception as e:
+        log.warning(f"Falha ao criar notificação: {e}")
 
 
-def marcar_como_lida(aluno_id: str, indice: int) -> None:
-    lista = carregar_notificacoes(aluno_id)
-    if 0 <= indice < len(lista):
-        lista[indice]["lida"] = True
-        _salvar_notif(aluno_id, lista)
-
-
-def marcar_todas_lidas(aluno_id: str) -> None:
-    lista = carregar_notificacoes(aluno_id)
-    for n in lista:
-        n["lida"] = True
-    _salvar_notif(aluno_id, lista)
-
-
-def limpar_notificacoes(aluno_id: str) -> None:
-    _salvar_notif(aluno_id, [])
-
-
-def contar_nao_lidas(aluno_id: str) -> int:
-    return sum(1 for n in carregar_notificacoes(aluno_id) if not n.get("lida"))
-
-
-def notificar(aluno_id: str, titulo: str, msg: str, tipo="info", origem="sistema") -> None:
+def notificar(aluno_id: str, titulo: str, msg: str,
+              tipo="info", origem="sistema") -> None:
     criar_notificacao(Notificacao(aluno_id, titulo, msg, tipo, origem=origem))
 
 
-def salvar_nota(aluno_id: str, disciplina: str, periodo: str, avaliacao: str, nota: float, peso: float = 1.0) -> None:
-    lista = _ler_json(NOTAS_DIR / f"{aluno_id}.json")
-    lista.append({"disciplina": disciplina, "periodo": periodo, "avaliacao": avaliacao,
-                  "nota": float(nota), "peso": float(peso), "lancada_em": datetime.now().isoformat()})
-    _gravar_json(NOTAS_DIR / f"{aluno_id}.json", lista)
+def marcar_como_lida(aluno_id: str, notif_id: int) -> None:
+    try:
+        supabase.table("notificacoes").update({"lida": True}).eq("id", notif_id).execute()
+    except Exception as e:
+        log.warning(f"Falha ao marcar notificação: {e}")
+
+
+def marcar_todas_lidas(aluno_id: str) -> None:
+    try:
+        supabase.table("notificacoes").update({"lida": True}) \
+            .eq("aluno_id", aluno_id).eq("lida", False).execute()
+    except Exception as e:
+        log.warning(f"Falha ao marcar notificações: {e}")
+
+
+def contar_nao_lidas(aluno_id: str) -> int:
+    try:
+        resp = (
+            supabase.table("notificacoes")
+            .select("id", count="exact")
+            .eq("aluno_id", aluno_id)
+            .eq("lida", False)
+            .execute()
+        )
+        return resp.count or 0
+    except Exception as e:
+        log.warning(f"Falha ao contar notificações: {e}")
+        return 0
+
+
+def renderizar_widget_notificacoes(aluno_id: str) -> None:
+    notifs = carregar_notificacoes(aluno_id)
+    if not notifs:
+        return
+    nao_lidas = sum(1 for n in notifs if not n.get("lida"))
+    with st.popover(f"🔔 Notificações ({nao_lidas} não lida(s))"):
+        c1, c2 = st.columns([3, 1])
+        c1.markdown(f"**{len(notifs)} notificação(ões) no total**")
+        if nao_lidas and c2.button("Marcar todas como lidas", key=f"mtl_{aluno_id}"):
+            marcar_todas_lidas(aluno_id)
+            st.rerun()
+        icones = {"sucesso": "✅", "info": "ℹ️", "alerta": "⚠️", "erro": "❌"}
+        for n in notifs[:20]:
+            icone = icones.get(n.get("tipo"), "🔔")
+            estado = "" if n.get("lida") else " **(nova)**"
+            with st.container(border=True):
+                st.markdown(f"{icone} **{esc(n.get('titulo', ''))}**{estado}")
+                st.caption(f"{str(n.get('criada_em', ''))[:16]} • origem: {esc(n.get('origem', 'sistema'))}")
+                st.write(esc(str(n.get("mensagem", ""))))
+                if not n.get("lida") and st.button("Marcar como lida", key=f"ml_{aluno_id}_{n['id']}"):
+                    marcar_como_lida(aluno_id, n["id"])
+                    st.rerun()
+
+
+# ==============================================================================
+# NOTAS — Supabase
+# ==============================================================================
+def salvar_nota(aluno_id: str, disciplina: str, periodo: str,
+                avaliacao: str, nota: float, peso: float = 1.0) -> None:
+    if not (0 <= nota <= 10):
+        raise ValueError("Nota deve estar entre 0 e 10.")
+    if peso <= 0:
+        raise ValueError("Peso deve ser maior que zero.")
+    supabase.table("notas").insert({
+        "aluno_id": aluno_id,
+        "disciplina": disciplina,
+        "periodo": periodo,
+        "avaliacao": avaliacao,
+        "nota": float(nota),
+        "peso": float(peso),
+        "lancada_por": st.session_state.get("usuario_key", "sistema"),
+    }).execute()
     notificar(aluno_id, "✅ Nota lançada", f"Nota de {disciplina}: {nota:.1f}", "sucesso")
 
 
 def media_por_disciplina(aluno_id: str) -> dict:
-    agregado: dict = {}
-    for n in _ler_json(NOTAS_DIR / f"{aluno_id}.json"):
-        agregado.setdefault(n["disciplina"], []).append((n["nota"], n["peso"]))
-    return {d: sum(n * p for n, p in pares) / (sum(p for _, p in pares) or 1) for d, pares in agregado.items()}
+    try:
+        resp = (
+            supabase.table("notas")
+            .select("disciplina,nota,peso")
+            .eq("aluno_id", aluno_id)
+            .execute()
+        )
+        pares_por_disc: dict = {}
+        for n in resp.data or []:
+            pares_por_disc.setdefault(n["disciplina"], []).append(
+                (float(n["nota"]), float(n["peso"]))
+            )
+        return {
+            d: sum(n * p for n, p in pares) / (sum(p for _, p in pares) or 1)
+            for d, pares in pares_por_disc.items()
+        }
+    except Exception as e:
+        log.warning(f"Falha ao calcular médias: {e}")
+        return {}
+
+
+# ==============================================================================
+# HELPERS PEDAGÓGICOS
+# ==============================================================================
+def periodos_disponiveis(aluno: Optional[dict] = None) -> list[str]:
+    base = list(DB()["config"].get("periodos", []))
+    if aluno:
+        for p in aluno.get("planejamentos_pedagogicos", []):
+            per = p.get("periodo")
+            if per and per not in base:
+                base.append(per)
+    return base
+
+
+def disciplinas_disponiveis() -> list[str]:
+    return list(DB()["config"].get("disciplinas", []))
+
+
+def parecer_automatico(aluno: dict) -> str:
+    d = aluno.get("dados", {})
+    op = aluno.get("operacao", {})
+    ats = aluno.get("atendimentos_processo", [])
+    ciclos = aluno.get("ciclos_intervencao", [])
+    fechados = sum(1 for c in ciclos if "Fechado" in str(c.get("status", "")))
+    abertos = sum(1 for c in ciclos if "Fechado" not in str(c.get("status", "")))
+    media_ganho = (
+        sum(float(a.get("ganho_ipsativo", 0) or 0) for a in ats) / len(ats)
+        if ats else 0.0
+    )
+    if media_ganho >= 15:
+        rec = "Recomenda-se manter o ritmo atual e reforçar a revisão espaçada D+7/D+30."
+    elif media_ganho > 0:
+        rec = "Recomenda-se consolidar as habilidades-foco com listas estruturantes adicionais."
+    else:
+        rec = "Recomenda-se revisar pré-requisitos e redesenhar a abordagem didática."
+    return (
+        f"{d.get('nome', 'O(A) estudante')} cumpriu "
+        f"{op.get('horas_realizadas', 0):.1f}h de {op.get('horas_contratadas', 0):.1f}h contratadas, "
+        f"com {op.get('presencas', 0)} presença(s) e {op.get('faltas', 0)} falta(s). "
+        f"Foram registrados {len(ats)} atendimento(s), com ganho ipsativo médio de "
+        f"{media_ganho:+.1f} p.p. por sessão. Ciclos fechados: {fechados}; "
+        f"em andamento: {abertos}. {rec}"
+    )
 
 
 # ==============================================================================
@@ -848,12 +908,16 @@ def exportar_excel(planejamentos: list) -> bytes | None:
         return None
     linhas = [{
         "Período": p.get("periodo", ""), "Disciplina": p.get("disciplina", ""),
-        "Professor(a)": p.get("professor_responsavel", ""), "Objetivo Geral": p.get("objetivo_geral", ""),
-        "Conteúdos": " | ".join(p.get("conteudos", [])), "Metodologia": p.get("metodologia", ""),
-        "Recursos": " | ".join(p.get("recursos", [])), "Avaliações": " | ".join(p.get("avaliacoes", [])),
-        "Observações": p.get("observacoes", ""), "Atualizado em": p.get("data_atualizacao", "")[:10],
+        "Professor(a)": p.get("professor_responsavel", ""),
+        "Objetivo Geral": p.get("objetivo_geral", ""),
+        "Conteúdos": " | ".join(p.get("conteudos", [])),
+        "Metodologia": p.get("metodologia", ""),
+        "Recursos": " | ".join(p.get("recursos", [])),
+        "Avaliações": " | ".join(p.get("avaliacoes", [])),
+        "Observações": p.get("observacoes", ""),
+        "Atualizado em": p.get("data_atualizacao", "")[:10],
     } for p in planejamentos]
-    df = pd.DataFrame(linhas) if linhas else pd.DataFrame(columns=["Período", "Disciplina", "Objetivo Geral"])
+    df = pd.DataFrame(linhas) if linhas else pd.DataFrame(columns=["Período", "Disciplina"])
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Planejamento")
@@ -875,23 +939,26 @@ def exportar_pdf(aluno_nome: str, planejamentos: list) -> bytes | None:
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import cm
         from reportlab.lib import colors
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+        from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                        Table, TableStyle, PageBreak)
     except ImportError:
         return None
-
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm,
-                            topMargin=2 * cm, bottomMargin=2 * cm, title="Planejamento Pedagógico")
+                            topMargin=2 * cm, bottomMargin=2 * cm,
+                            title="Planejamento Pedagógico")
     styles = getSampleStyleSheet()
     azul = colors.HexColor("#1E3A8A")
-    h1 = ParagraphStyle("H1", parent=styles["Heading1"], textColor=azul, fontSize=18, spaceAfter=10)
-    h2 = ParagraphStyle("H2", parent=styles["Heading2"], textColor=azul, fontSize=14, spaceBefore=12, spaceAfter=6)
+    h1 = ParagraphStyle("H1", parent=styles["Heading1"], textColor=azul,
+                        fontSize=18, spaceAfter=10)
+    h2 = ParagraphStyle("H2", parent=styles["Heading2"], textColor=azul,
+                        fontSize=14, spaceBefore=12, spaceAfter=6)
     body = ParagraphStyle("Body", parent=styles["BodyText"], fontSize=10, leading=14)
     P = lambda t, s=body: Paragraph(xml_esc(str(t)), s)
     lista = lambda itens: "<br/>".join("• " + xml_esc(str(i)) for i in itens) or "—"
-
     story = [P(f"Planejamento Pedagógico — {aluno_nome}", h1),
-             P(f"SOS Exatas • Emissão: {datetime.now().strftime('%d/%m/%Y %H:%M')}"), Spacer(1, 0.5 * cm)]
+             P(f"SOS Exatas • Emissão: {datetime.now().strftime('%d/%m/%Y %H:%M')}"),
+             Spacer(1, 0.5 * cm)]
     if not planejamentos:
         story.append(P("Nenhum planejamento cadastrado."))
     for i, p in enumerate(planejamentos):
@@ -906,7 +973,8 @@ def exportar_pdf(aluno_nome: str, planejamentos: list) -> bytes | None:
             ("Observações", P(p.get("observacoes") or "—")),
             ("Atualizado em", P(p.get("data_atualizacao", "")[:10])),
         ]
-        tabela = Table([[Paragraph(f"<b>{k}</b>", body), v] for k, v in linhas], colWidths=[4 * cm, 12 * cm])
+        tabela = Table([[Paragraph(f"<b>{k}</b>", body), v] for k, v in linhas],
+                       colWidths=[4 * cm, 12 * cm])
         tabela.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EFF3FB")),
             ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#B8C4E0")),
@@ -920,7 +988,7 @@ def exportar_pdf(aluno_nome: str, planejamentos: list) -> bytes | None:
 
 
 # ==============================================================================
-# LOGO INSTITUCIONAL
+# LOGO
 # ==============================================================================
 def exibir_logo_institucional(tamanho=180, centralizado=False):
     caminho = next((a for a in ["logo.png", "logo.jpg", "logo.jpeg"] if os.path.exists(a)), None)
@@ -947,13 +1015,12 @@ def exibir_logo_institucional(tamanho=180, centralizado=False):
 
 
 # ==============================================================================
-# MATERIAL OFICIAL SOS EXATAS (SUPABASE STORAGE & POSTGRESQL)
+# MATERIAL OFICIAL — Supabase
 # ==============================================================================
 SUPABASE_BUCKET = "materiais_oficiais"
 
-MAT_DISCIPLINAS = ["Matemática", "Física", "Química", "Português",
-                   "Redação", "Biologia", "Ciências", "História",
-                   "Geografia", "Inglês"]
+MAT_DISCIPLINAS = ["Matemática", "Física", "Química", "Português", "Redação",
+                   "Biologia", "Ciências", "História", "Geografia", "Inglês"]
 MAT_SERIES = ["6º Ano", "7º Ano", "8º Ano", "9º Ano",
               "1ª série EM", "2ª série EM", "3ª série EM",
               "Pré-Vestibular", "Geral"]
@@ -973,120 +1040,171 @@ def mat_listar_nuvem(filtros: dict = None) -> list:
                 query = query.eq("serie", filtros["serie"])
             if filtros.get("tipo") and filtros["tipo"] != "Todos":
                 query = query.eq("tipo", filtros["tipo"])
-            if filtros.get("busca"):
-                busca = filtros["busca"]
-                query = query.or_(f"titulo.ilike.%{busca}%,descricao.ilike.%{busca}%,tags.ilike.%{busca}%")
-
         resp = query.order("criado_em", desc=True).execute()
-        return resp.data or []
+        dados = resp.data or []
+        busca = (filtros or {}).get("busca", "").strip().lower()
+        if busca:
+            dados = [m for m in dados
+                     if busca in (m.get("titulo") or "").lower()
+                     or busca in (m.get("descricao") or "").lower()
+                     or busca in (m.get("tags") or "").lower()
+                     or busca in (m.get("autor") or "").lower()]
+        return dados
     except Exception as e:
-        log.error(f"Erro ao listar materiais do Supabase: {e}")
+        log.error(f"Erro ao listar materiais: {type(e).__name__}: {e}")
+        st.error(f"⚠️ Erro ao consultar materiais: {e}")
         return []
+
+
+def _garantir_bucket() -> None:
+    try:
+        existentes = {(b.name if hasattr(b, "name") else b.get("name"))
+                      for b in supabase.storage.list_buckets()}
+        if SUPABASE_BUCKET not in existentes:
+            supabase.storage.create_bucket(SUPABASE_BUCKET, options={"public": True})
+            log.info(f"Bucket '{SUPABASE_BUCKET}' criado.")
+    except Exception as e:
+        log.warning(f"Verificação/criação de bucket falhou: {e}")
 
 
 def view_material_oficial(aluno, perfil, usuario):
     card("titulo-pp",
          "<h2>📚 Material Oficial SOS Exatas (Nuvem Supabase)</h2>"
          "<p>Biblioteca centralizada com apostilas, listas, simulados e materiais didáticos sincronizados na nuvem.</p>")
-    st.caption("ℹ️ Módulo unificado ao Supabase Storage. Dados e arquivos protegidos contra perda em atualizações.")
+    st.caption("ℹ️ Módulo unificado ao Supabase Storage. Dados e arquivos protegidos.")
 
     materiais = mat_listar_nuvem()
     k = st.columns(3)
     k[0].metric("📦 Total de Materiais", len(materiais))
-    k[1].metric("📖 Disciplinas", len(set(m["disciplina"] for m in materiais)) if materiais else 0)
-    k[2].metric("☁️ Armazenamento", "Supabase Storage (100% Persistente)")
+    k[1].metric("📖 Disciplinas",
+                len(set(m["disciplina"] for m in materiais)) if materiais else 0)
+    k[2].metric("☁️ Armazenamento", "Supabase Storage")
     st.markdown("---")
 
-    # Formulário direto para teste imediato de cadastro
-    st.markdown("### ➕ Cadastrar Novo Material na Nuvem")
-    with st.form("form_material_nuvem", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            titulo = st.text_input("Título *")
-            disciplina = st.selectbox("Disciplina *", MAT_DISCIPLINAS)
-            serie = st.selectbox("Série *", MAT_SERIES)
-            tipo = st.selectbox("Tipo *", MAT_TIPOS)
-        with c2:
-            modulo = st.selectbox("Módulo", [""] + MAT_MODULOS)
-            autor = st.text_input("Autor / Fonte")
-            versao = st.text_input("Versão", value="1.0")
-            tags = st.text_input("Tags (separadas por vírgula)")
+    if pode(perfil, "criar"):
+        st.markdown("### ➕ Cadastrar Novo Material na Nuvem")
+        with st.form("form_material_nuvem", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                titulo = st.text_input("Título *")
+                disciplina = st.selectbox("Disciplina *", MAT_DISCIPLINAS)
+                serie = st.selectbox("Série *", MAT_SERIES)
+                tipo = st.selectbox("Tipo *", MAT_TIPOS)
+            with c2:
+                modulo = st.selectbox("Módulo", [""] + MAT_MODULOS)
+                autor = st.text_input("Autor / Fonte")
+                versao = st.text_input("Versão", value="1.0")
+                tags = st.text_input("Tags (separadas por vírgula)")
 
-        descricao = st.text_area("Descrição", height=80)
-        st.markdown("**📎 Arquivo do Material (Salvo no Supabase Storage)**")
-        arquivo = st.file_uploader(
-            "Selecione o arquivo",
-            type=["pdf", "docx", "doc", "xlsx", "pptx", "png", "jpg", "jpeg", "zip"],
-            label_visibility="collapsed"
-        )
-        submit = st.form_submit_button("💾 Enviar para o Supabase Storage", type="primary", **W)
+            descricao = st.text_area("Descrição", height=80)
+            st.markdown("**📎 Arquivo do Material**")
+            arquivo = st.file_uploader(
+                "Selecione o arquivo",
+                type=["pdf", "docx", "doc", "xlsx", "pptx", "png", "jpg", "jpeg", "zip"],
+                label_visibility="collapsed",
+            )
+            submit = st.form_submit_button(
+                "💾 Enviar para o Supabase Storage", type="primary", **W)
 
-        if submit:
-            if not titulo.strip():
-                st.error("O campo **Título** é obrigatório.")
-            elif not arquivo:
-                st.error("É necessário anexar um arquivo.")
-            else:
-                try:
-                    ext = Path(arquivo.name).suffix.lower().lstrip(".")
-                    nome_unico = f"{uuid.uuid4().hex[:8]}_{nome_seguro(arquivo.name)}"
-                    caminho_storage = f"{disciplina}/{serie}/{nome_unico}"
+            if submit:
+                if not titulo.strip():
+                    st.error("O campo **Título** é obrigatório.")
+                elif not arquivo:
+                    st.error("É necessário anexar um arquivo.")
+                else:
+                    erro_arq = validar_upload_magic(arquivo)
+                    if erro_arq:
+                        st.error(f"❌ {erro_arq}")
+                        st.stop()
+                    _garantir_bucket()
+                    caminho_storage_para_rollback = None
+                    try:
+                        ext = Path(arquivo.name).suffix.lower().lstrip(".")
+                        nome_unico = f"{uuid.uuid4().hex[:8]}_{nome_seguro(arquivo.name)}"
+                        caminho_storage = f"{disciplina}/{serie}/{nome_unico}"
+                        file_bytes = arquivo.getvalue()
 
-                    file_bytes = arquivo.getvalue()
-                    supabase.storage.from_(SUPABASE_BUCKET).upload(
-                        path=caminho_storage,
-                        file=file_bytes,
-                        file_options={"content-type": arquivo.type or "application/octet-stream"}
-                    )
+                        supabase.storage.from_(SUPABASE_BUCKET).upload(
+                            path=caminho_storage,
+                            file=file_bytes,
+                            file_options={
+                                "content-type": arquivo.type or "application/octet-stream",
+                                "upsert": "false",
+                            },
+                        )
+                        caminho_storage_para_rollback = caminho_storage
 
-                    u_nome = usuario["nome"] if isinstance(usuario, dict) else str(usuario)
-                    supabase.table("materiais_oficiais").insert({
-                        "titulo": titulo.strip(),
-                        "descricao": descricao.strip(),
-                        "disciplina": disciplina,
-                        "serie": serie,
-                        "tipo": tipo,
-                        "modulo": modulo,
-                        "tags": tags.strip(),
-                        "autor": autor.strip(),
-                        "versao": versao.strip() or "1.0",
-                        "file_path": caminho_storage,
-                        "file_size_kb": round(len(file_bytes) / 1024, 2),
-                        "file_ext": ext,
-                        "criado_por": u_nome
-                    }).execute()
+                        u_nome = usuario.get("nome") if isinstance(usuario, dict) else str(usuario)
+                        supabase.table("materiais_oficiais").insert({
+                            "titulo": titulo.strip(),
+                            "descricao": descricao.strip(),
+                            "disciplina": disciplina,
+                            "serie": serie,
+                            "tipo": tipo,
+                            "modulo": modulo,
+                            "tags": tags.strip(),
+                            "autor": autor.strip(),
+                            "versao": (versao.strip() or "1.0"),
+                            "file_path": caminho_storage,
+                            "file_size_kb": round(len(file_bytes) / 1024, 2),
+                            "file_ext": ext,
+                            "criado_por": u_nome,
+                        }).execute()
+                    except Exception as e:
+                        log.error(f"Erro no upload: {type(e).__name__}: {e}")
+                        if caminho_storage_para_rollback:
+                            try:
+                                supabase.storage.from_(SUPABASE_BUCKET).remove(
+                                    [caminho_storage_para_rollback])
+                            except Exception:
+                                pass
+                        st.error(f"❌ Falha no upload: {e}")
+                        st.stop()
 
                     try:
+                        enviados = 0
                         for aid in DB()["alunos"]:
                             notificar(aid, "📚 Novo material na nuvem",
                                       f"{tipo}: {titulo.strip()} ({disciplina} • {serie})",
                                       tipo="info", origem="professor")
-                    except Exception:
-                        pass
+                            enviados += 1
+                            if enviados >= 200:
+                                break
+                    except Exception as e:
+                        log.warning(f"Notificações parciais: {e}")
 
                     auditar("material_nuvem_criado", titulo.strip())
-                    _salvar_e_recarregar("✅ Material enviado e salvo com sucesso na nuvem!")
-                except Exception as e:
-                    log.error(f"Erro no upload para o Supabase Storage: {e}")
-                    st.error(f"Erro ao gravar arquivo na nuvem: {e}")
+                    try:
+                        salvar_banco()
+                    except ConflitoDeVersao:
+                        _carregar_banco_remoto.clear()
+                        st.session_state.db = carregar_banco(forcar=True)
+                    except Exception as e:
+                        log.warning(f"DB não salvo pós-upload (material OK): {e}")
+
+                    _carregar_banco_remoto.clear()
+                    _flash("success", f"✅ Material '{titulo.strip()}' publicado!")
+                    st.rerun()
 
     st.markdown("---")
     st.markdown("### 🔍 Biblioteca de Materiais Cadastrados")
     if not materiais:
-        st.info("📭 Nenhum material cadastrado na nuvem até o momento.")
+        st.info("📭 Nenhum material cadastrado ainda.")
     else:
         for m in materiais:
             with st.container(border=True):
                 st.markdown(f"**{m['titulo']}** — {m['disciplina']} • {m['serie']} ({m['tipo']})")
+                if m.get("descricao"):
+                    st.caption(m["descricao"])
                 try:
-                    url_publica = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(m["file_path"])
-                    st.markdown(f"[📥 Baixar Ficha]({url_publica})", unsafe_allow_html=True)
-                except Exception:
-                    pass
+                    url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(m["file_path"])
+                    st.markdown(f"[📥 Baixar]({url})", unsafe_allow_html=True)
+                except Exception as e:
+                    st.caption(f"⚠️ Link indisponível: {e}")
 
 
 # ==============================================================================
-# NOVOS MÓDULOS: CONTRATOS & AGENDA
+# CONTRATOS & AGENDA
 # ==============================================================================
 def view_contratos(aluno, perfil, usuario):
     st.title("📄 Gestão de Contratos Acadêmicos")
@@ -1096,18 +1214,20 @@ def view_contratos(aluno, perfil, usuario):
         d = aluno["dados"]
         st.subheader(f"Contratos de: {d['nome']} ({d['id']})")
         contratos_aluno = aluno.setdefault("contratos", [])
-
         with st.expander("➕ Adicionar Novo Contrato"):
             with st.form("form_novo_contrato"):
                 c1, c2 = st.columns(2)
-                num_c = c1.text_input("Número do Contrato", value=f"SOS-2026-{uuid.uuid4().hex[:4].upper()}")
+                num_c = c1.text_input("Número do Contrato",
+                                      value=f"SOS-2026-{uuid.uuid4().hex[:4].upper()}")
                 valor_c = c2.number_input("Valor Total (R$)", 0.0, 50000.0, 4500.0, 100.0)
                 d_inicio = c1.date_input("Data de Início", date.today())
                 d_fim = c2.date_input("Data de Término", date.today() + timedelta(days=180))
-                status_c = c1.selectbox("Status", ["Vigente", "Encerrado", "Pendente de Assinatura", "Renovação Necessária"])
-                pag_c = c2.selectbox("Forma de Pagamento", ["Boleto / Pix Mensal", "Cartão de Crédito", "À Vista"])
+                status_c = c1.selectbox("Status", ["Vigente", "Encerrado",
+                                                   "Pendente de Assinatura",
+                                                   "Renovação Necessária"])
+                pag_c = c2.selectbox("Forma de Pagamento",
+                                     ["Boleto / Pix Mensal", "Cartão de Crédito", "À Vista"])
                 obs_c = st.text_area("Observações Contratuais")
-
                 if st.form_submit_button("Salvar Contrato"):
                     contratos_aluno.append({
                         "id": novo_id("CONT"),
@@ -1117,83 +1237,72 @@ def view_contratos(aluno, perfil, usuario):
                         "status": status_c,
                         "valor_total": float(valor_c),
                         "forma_pagamento": pag_c,
-                        "observacoes": obs_c.strip()
+                        "observacoes": obs_c.strip(),
                     })
                     auditar("contrato_criado", f"{d['id']} {num_c}")
-                    _salvar_e_recarregar("Contrato cadastrado com sucesso!")
-
+                    _salvar_e_recarregar("Contrato cadastrado!")
         if contratos_aluno:
-            rows = []
-            for c in contratos_aluno:
-                rows.append({
-                    "Nº Contrato": c.get("numero_contrato"),
-                    "Início": c.get("data_inicio"),
-                    "Término": c.get("data_fim"),
-                    "Status": c.get("status"),
-                    "Valor (R$)": f"R$ {c.get('valor_total', 0):,.2f}",
-                    "Pagamento": c.get("forma_pagamento")
-                })
+            rows = [{"Nº Contrato": c.get("numero_contrato"),
+                     "Início": c.get("data_inicio"),
+                     "Término": c.get("data_fim"),
+                     "Status": c.get("status"),
+                     "Valor (R$)": f"R$ {c.get('valor_total', 0):,.2f}",
+                     "Pagamento": c.get("forma_pagamento")}
+                    for c in contratos_aluno]
             st.dataframe(pd.DataFrame(rows), hide_index=True, **W)
         else:
-            st.info("Nenhum contrato cadastrado para este estudante.")
+            st.info("Nenhum contrato cadastrado.")
     else:
-        st.info("Visão Geral de Contratos e Termos Acadêmicos do SOS Exatas.")
+        st.info("Visão Geral de Contratos.")
         if aluno and aluno.get("contratos"):
             for c in aluno["contratos"]:
                 with st.container(border=True):
                     st.markdown(f"**Contrato Nº:** `{c.get('numero_contrato')}` — **Status:** {c.get('status')}")
                     st.write(f"Período: {c.get('data_inicio')} até {c.get('data_fim')} | Valor: R$ {c.get('valor_total', 0):,.2f}")
-                    if c.get("observacoes"):
-                        st.caption(f"Obs: {c.get('observacoes')}")
 
 
 def view_agenda(aluno, perfil, usuario):
-    st.title("📅 Agenda & Calendário de Atendimentos")
+    st.title("📅 Agenda & Calendário")
     agenda_global = DB().setdefault("agenda", [])
-
     eh_gestor = pode(perfil, "gerenciar_agenda") or perfil in (Perfil.ADMIN, Perfil.COORDENADOR, Perfil.PROFESSOR)
 
     if eh_gestor:
-        with st.expander("➕ Agendar Novo Compromisso / Aula"):
+        with st.expander("➕ Agendar Novo Compromisso"):
             with st.form("form_nova_agenda", clear_on_submit=True):
                 c1, c2 = st.columns(2)
-                titulo_ag = c1.text_input("Título do Compromisso *")
-                tipo_ag = c2.selectbox("Tipo", ["Aula 1:1", "Mentoria Coletiva", "Banca de Estudos", "Reunião Pedagógica", "Simulado"])
+                titulo_ag = c1.text_input("Título *")
+                tipo_ag = c2.selectbox("Tipo", ["Aula 1:1", "Mentoria Coletiva",
+                                                "Banca de Estudos", "Reunião Pedagógica", "Simulado"])
                 data_ag = c1.date_input("Data", date.today())
                 hora_ag = c2.text_input("Horário (HH:MM)", value="14:00")
-                local_ag = c1.text_input("Local ou Link Virtual", value="Sede SOS Exatas / Sala Presencial")
-                resp_ag = c2.text_input("Responsável / Professor", value=usuario.get("nome", "Coordenação"))
-                part_ag = st.text_input("Participantes / Turma Alvo", value="Geral")
-
-                if st.form_submit_button("Agendar na Agenda Global"):
+                local_ag = c1.text_input("Local ou Link", value="Sede SOS Exatas")
+                resp_ag = c2.text_input("Responsável", value=usuario.get("nome", "Coordenação"))
+                part_ag = st.text_input("Participantes / Turma", value="Geral")
+                if st.form_submit_button("Agendar"):
                     if not titulo_ag.strip():
-                        st.error("Informe o título do compromisso.")
+                        st.error("Informe o título.")
                     else:
                         agenda_global.append({
-                            "id": novo_id("AG"),
-                            "titulo": titulo_ag.strip(),
-                            "data": str(data_ag),
-                            "horario": hora_ag.strip(),
+                            "id": novo_id("AG"), "titulo": titulo_ag.strip(),
+                            "data": str(data_ag), "horario": hora_ag.strip(),
                             "local_ou_link": local_ag.strip(),
                             "responsavel": resp_ag.strip(),
-                            "tipo": tipo_ag,
-                            "participantes": part_ag.strip()
+                            "tipo": tipo_ag, "participantes": part_ag.strip(),
                         })
                         auditar("agenda_criada", titulo_ag.strip())
-                        _salvar_e_recarregar("Compromisso agendado com sucesso!")
+                        _salvar_e_recarregar("Compromisso agendado!")
 
-    st.subheader("🗓️ Próximos Eventos e Aulas")
+    st.subheader("🗓️ Próximos Eventos")
     if not agenda_global:
-        st.info("Nenhum evento agendado no momento.")
+        st.info("Nenhum evento agendado.")
     else:
-        agenda_ordenada = sorted(agenda_global, key=lambda x: (x.get("data", ""), x.get("horario", "")))
-        for ev in agenda_ordenada:
+        for ev in sorted(agenda_global, key=lambda x: (x.get("data", ""), x.get("horario", ""))):
             with st.container(border=True):
                 col1, col2 = st.columns([4, 1])
                 with col1:
                     st.markdown(f"**📌 {esc(ev['titulo'])}** ({esc(ev.get('tipo', 'Evento'))})")
-                    st.write(f"📅 **Data:** {ev.get('data')} às {ev.get('horario')} | 👤 **Responsável:** {esc(ev.get('responsavel', '—'))}")
-                    st.write(f"📍 **Local/Link:** {esc(ev.get('local_ou_link', '—'))} | 👥 **Participantes:** {esc(ev.get('participantes', '—'))}")
+                    st.write(f"📅 {ev.get('data')} às {ev.get('horario')} | 👤 {esc(ev.get('responsavel', '—'))}")
+                    st.write(f"📍 {esc(ev.get('local_ou_link', '—'))} | 👥 {esc(ev.get('participantes', '—'))}")
                 with col2:
                     if eh_gestor and st.button("🗑️ Excluir", key=f"del_ev_{ev['id']}"):
                         agenda_global.remove(ev)
@@ -1202,13 +1311,13 @@ def view_agenda(aluno, perfil, usuario):
 
 
 # ==============================================================================
-# VIEWS DO SISTEMA
+# PLANEJAMENTO
 # ==============================================================================
 def view_planejamento(aluno, perfil, usuario):
     d = aluno["dados"]
     aid = d["id"]
-    card("titulo-pp", f"<h2>📚 Planejamento Pedagógico e Situação Escolar</h2>"
-                     f"<p>Objetivos, avaliações, notas e situação pedagógica de <b>{esc(d['nome'])}</b>.</p>")
+    card("titulo-pp", f"<h2>📚 Planejamento Pedagógico</h2>"
+                     f"<p>Objetivos, avaliações e situação pedagógica de <b>{esc(d['nome'])}</b>.</p>")
     renderizar_widget_notificacoes(aid)
 
     periodos = periodos_disponiveis(aluno)
@@ -1241,14 +1350,10 @@ def view_planejamento(aluno, perfil, usuario):
         xls = exportar_excel(planos)
         pdf = exportar_pdf(d["nome"], planos)
         if xls:
-            e1.download_button("⬇️ Baixar Excel", xls, f"planejamento_{base}.xlsx",
+            e1.download_button("⬇️ Excel", xls, f"planejamento_{base}.xlsx",
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", **W)
-        else:
-            e1.caption("Instale `openpyxl` para exportar Excel.")
         if pdf:
-            e2.download_button("⬇️ Baixar PDF", pdf, f"planejamento_{base}.pdf", "application/pdf", **W)
-        else:
-            e2.caption("Instale `reportlab` para exportar PDF.")
+            e2.download_button("⬇️ PDF", pdf, f"planejamento_{base}.pdf", "application/pdf", **W)
     st.markdown("---")
 
     idx_edit = st.session_state.get("pp_idx")
@@ -1265,15 +1370,16 @@ def view_planejamento(aluno, perfil, usuario):
                 dis_c = st.selectbox("Disciplina *", dis_opts,
                                      index=dis_opts.index(ed["disciplina"]) if ed.get("disciplina") in dis_opts else 0)
             with b:
-                prof_c = st.text_input("Professor(a) Responsável", value=ed.get("professor_responsavel", usuario["nome"]))
+                prof_c = st.text_input("Professor(a) Responsável",
+                                       value=ed.get("professor_responsavel", usuario["nome"]))
                 obj_c = st.text_area("Objetivo Geral *", value=ed.get("objetivo_geral", ""), height=80)
             cont = st.text_area("Conteúdos (um por linha)", "\n".join(ed.get("conteudos", [])), height=90)
             meto = st.text_area("Metodologia", ed.get("metodologia", ""), height=70)
             rec = st.text_area("Recursos (um por linha)", "\n".join(ed.get("recursos", [])), height=70)
             ava = st.text_area("Avaliações (uma por linha)", "\n".join(ed.get("avaliacoes", [])), height=70)
-            obs = st.text_area("Observações / Situação Escolar", ed.get("observacoes", ""), height=60)
+            obs = st.text_area("Observações", ed.get("observacoes", ""), height=60)
             s1, s2 = st.columns(2)
-            salvou = s1.form_submit_button("💾 Salvar Planejamento", type="primary", **W)
+            salvou = s1.form_submit_button("💾 Salvar", type="primary", **W)
             cancelou = s2.form_submit_button("❌ Cancelar", **W)
 
         if cancelou:
@@ -1283,12 +1389,13 @@ def view_planejamento(aluno, perfil, usuario):
             if not obj_c.strip():
                 st.error("O Objetivo Geral é obrigatório.")
             else:
-                dup = any(i != idx_edit and p.get("periodo") == per_c and p.get("disciplina") == dis_c
-                          for i, p in enumerate(todos))
+                dup = any(i != idx_edit and p.get("periodo") == per_c
+                          and p.get("disciplina") == dis_c for i, p in enumerate(todos))
                 if dup:
-                    st.error("Já existe um plano para este período e disciplina. Edite o existente.")
+                    st.error("Já existe um plano para este período e disciplina.")
                 else:
-                    novo = {"periodo": per_c, "disciplina": dis_c, "professor_responsavel": prof_c.strip(),
+                    novo = {"periodo": per_c, "disciplina": dis_c,
+                            "professor_responsavel": prof_c.strip(),
                             "objetivo_geral": obj_c.strip(),
                             "conteudos": [x.strip() for x in cont.splitlines() if x.strip()],
                             "metodologia": meto.strip(),
@@ -1296,25 +1403,27 @@ def view_planejamento(aluno, perfil, usuario):
                             "avaliacoes": [x.strip() for x in ava.splitlines() if x.strip()],
                             "observacoes": obs.strip(),
                             "data_criacao": ed.get("data_criacao", str(date.today())),
-                            "data_atualizacao": str(date.today()), "anexos": ed.get("anexos", [])}
+                            "data_atualizacao": str(date.today()),
+                            "anexos": ed.get("anexos", [])}
                     if ed:
                         todos[idx_edit] = novo
                     else:
                         todos.append(novo)
                         notificar(aid, "📚 Novo planejamento publicado",
-                                  f"Novo planejamento de {dis_c} para {per_c}.", origem="professor")
+                                  f"Planejamento de {dis_c} para {per_c}.",
+                                  origem="professor")
                     auditar("planejamento_salvo", f"{aid} {dis_c} {per_c}")
                     st.session_state["pp_idx"] = None
                     _salvar_e_recarregar("Planejamento gravado!")
 
     if not planos:
-        st.info("📭 Nenhum planejamento para os filtros selecionados.")
+        st.info("📭 Nenhum planejamento.")
     for pos, (i_real, p) in enumerate(filtrados):
         with st.expander(f"📘 {p.get('disciplina')} • {p.get('periodo')}", expanded=(pos == 0)):
             ca, cb = st.columns([3, 1])
             ca.markdown(f"**🎯 Objetivo Geral:** {esc(p.get('objetivo_geral', ''))}")
             cb.markdown(f"**👨‍🏫 Responsável:** {esc(p.get('professor_responsavel', ''))}")
-            cb.caption(f"Atualizado em: {p.get('data_atualizacao', '')[:10]}")
+            cb.caption(f"Atualizado: {p.get('data_atualizacao', '')[:10]}")
             st.markdown("---")
             l, r = st.columns(2)
             with l:
@@ -1337,9 +1446,12 @@ def view_planejamento(aluno, perfil, usuario):
                     nota = n1.number_input("Nota (0-10):", 0.0, 10.0, 8.0, 0.5, key=f"nt_{aid}_{i_real}")
                     peso = n2.number_input("Peso:", 0.5, 5.0, 1.0, 0.5, key=f"ps_{aid}_{i_real}")
                     if st.button("Gravar Nota", key=f"gn_{aid}_{i_real}"):
-                        salvar_nota(aid, p["disciplina"], p["periodo"], av, nota, peso)
-                        auditar("nota_lancada", f"{aid} {p['disciplina']} {av}={nota}")
-                        _salvar_e_recarregar("Nota gravada!")
+                        try:
+                            salvar_nota(aid, p["disciplina"], p["periodo"], av, nota, peso)
+                            auditar("nota_lancada", f"{aid} {p['disciplina']} {av}={nota}")
+                            _salvar_e_recarregar("Nota gravada!")
+                        except Exception as e:
+                            st.error(f"Erro ao gravar nota: {e}")
 
             b1, b2, _ = st.columns([1, 1, 4])
             if pode(perfil, "editar") and b1.button("✏️ Editar", key=f"ed_{aid}_{i_real}"):
@@ -1347,33 +1459,38 @@ def view_planejamento(aluno, perfil, usuario):
                 st.rerun()
             if pode(perfil, "excluir"):
                 with b2.popover("🗑️ Excluir"):
-                    st.warning("Confirmar exclusão deste planejamento?")
+                    st.warning("Confirmar exclusão?")
                     if st.button("Sim, excluir", key=f"del_{aid}_{i_real}"):
                         todos.pop(i_real)
-                        auditar("planejamento_excluido", f"{aid} {p.get('disciplina')} {p.get('periodo')}")
-                        _salvar_e_recarregar("Planejamento excluído com sucesso!")
+                        auditar("planejamento_excluido", f"{aid}")
+                        _salvar_e_recarregar("Planejamento excluído!")
 
     medias = media_por_disciplina(aid)
     if medias:
         st.markdown("---")
         st.subheader("📊 Médias Ponderadas por Disciplina")
-        df = pd.DataFrame({"Disciplina": list(medias), "Média": [round(v, 2) for v in medias.values()]})
-        fig = px.bar(df.sort_values("Média", ascending=False), x="Disciplina", y="Média", text="Média",
-                     range_y=[0, 10], color="Média", color_continuous_scale=["#D97706", "#1E3A8A"])
+        df = pd.DataFrame({"Disciplina": list(medias),
+                           "Média": [round(v, 2) for v in medias.values()]})
+        fig = px.bar(df.sort_values("Média", ascending=False), x="Disciplina",
+                     y="Média", text="Média", range_y=[0, 10], color="Média",
+                     color_continuous_scale=["#D97706", "#1E3A8A"])
         fig.update_traces(texttemplate="%{text:.1f}", textposition="outside")
         fig.update_layout(height=350, coloraxis_showscale=False)
         st.plotly_chart(fig, **W)
 
 
+# ==============================================================================
+# DIRETÓRIO
+# ==============================================================================
 def view_diretorio(aluno, perfil, usuario):
-    st.title("Diretório Geral de Gestão — SOS Exatas")
+    st.title("Diretório Geral de Gestão")
     alunos = DB()["alunos"]
     eh_admin = (perfil == Perfil.ADMIN)
 
     if eh_admin:
-        st.info("🛠️ **Modo Administrador Ativo:** Você pode editar diretamente os dados cadastrais e operacionais de qualquer estudante, família ou professor.")
+        st.info("🛠️ **Modo Administrador Ativo.**")
 
-    t1, t2, t3 = st.tabs(["👨‍🎓 Alunos", "👪 Famílias & Responsáveis", "👨‍🏫 Professores & Tutores"])
+    t1, t2, t3 = st.tabs(["👨‍🎓 Alunos", "👪 Famílias", "👨‍🏫 Professores"])
 
     with t1:
         if alunos:
@@ -1382,25 +1499,24 @@ def view_diretorio(aluno, perfil, usuario):
                 d, op = a["dados"], a["operacao"]
                 saldo = op["horas_contratadas"] - op["horas_realizadas"]
                 rows.append({
-                    "Matrícula": aid,
-                    "Nome": d["nome"],
+                    "Matrícula": aid, "Nome": d["nome"],
                     "Modalidade": d.get("modalidade", ""),
                     "Escola / Série": f"{d.get('escola', 'N/D')} ({d.get('serie', 'N/D')})",
                     "Contratadas": f"{op['horas_contratadas']:.1f}h",
                     "Realizadas": f"{op['horas_realizadas']:.1f}h",
                     "Saldo": f"{saldo:.1f}h",
-                    "Status": "🚨 Crítico (Renovar)" if saldo <= 3 else "🟢 Regular"
+                    "Status": "🚨 Crítico" if saldo <= 3 else "🟢 Regular",
                 })
             st.dataframe(pd.DataFrame(rows), hide_index=True, **W)
 
             if eh_admin:
                 st.markdown("---")
-                st.subheader("✏️ Editar Cadastro & Operação de Estudante")
+                st.subheader("✏️ Editar Cadastro & Operação")
                 alvo_aluno = st.selectbox(
-                    "Selecione o Estudante para Editar:",
+                    "Selecione o Estudante:",
                     list(alunos),
                     format_func=lambda x: f"{alunos[x]['dados']['nome']} ({x})",
-                    key="edit_aluno_select"
+                    key="edit_aluno_select",
                 )
                 if alvo_aluno:
                     al_edit = alunos[alvo_aluno]
@@ -1410,27 +1526,33 @@ def view_diretorio(aluno, perfil, usuario):
                     with st.form(f"form_admin_edit_aluno_{alvo_aluno}"):
                         c1, c2 = st.columns(2)
                         with c1:
-                            novo_nome = st.text_input("Nome do Aluno", value=d_edit.get("nome", ""))
+                            novo_nome = st.text_input("Nome", value=d_edit.get("nome", ""))
                             nova_mod = st.selectbox(
-                                "Modalidade Principal",
-                                MODALIDADES_VALIDAS,
-                                index=MODALIDADES_VALIDAS.index(d_edit.get("modalidade")) if d_edit.get("modalidade") in MODALIDADES_VALIDAS else 0
+                                "Modalidade", MODALIDADES_VALIDAS,
+                                index=MODALIDADES_VALIDAS.index(d_edit.get("modalidade"))
+                                if d_edit.get("modalidade") in MODALIDADES_VALIDAS else 0,
                             )
                             nova_escola = st.text_input("Escola", value=d_edit.get("escola", ""))
                             nova_serie = st.text_input("Série", value=d_edit.get("serie", ""))
-                            novo_obj = st.text_input("Objetivo / Foco", value=d_edit.get("objetivo_estudante", ""))
+                            novo_obj = st.text_input("Objetivo", value=d_edit.get("objetivo_estudante", ""))
                         with c2:
                             novo_resp = st.text_input("Responsáveis", value=d_edit.get("responsaveis", ""))
-                            novo_ct = st.text_input("Contato / WhatsApp", value=d_edit.get("contato", ""))
-                            novas_contratadas = st.number_input("Horas Contratadas", 0.0, 500.0, float(op_edit.get("horas_contratadas", 40.0)), 0.5)
-                            novas_realizadas = st.number_input("Horas Realizadas", 0.0, 500.0, float(op_edit.get("horas_realizadas", 0.0)), 0.5)
-                            novo_valor = st.number_input("Valor Hora/Aula (R$)", 0.0, 1000.0, float(op_edit.get("valor_hora_contrato", 130.0)), 5.0)
-
+                            novo_ct = st.text_input("Contato", value=d_edit.get("contato", ""))
+                            novas_contratadas = st.number_input("Horas Contratadas", 0.0, 500.0,
+                                                                float(op_edit.get("horas_contratadas", 40.0)), 0.5)
+                            novas_realizadas = st.number_input("Horas Realizadas", 0.0, 500.0,
+                                                               float(op_edit.get("horas_realizadas", 0.0)), 0.5)
+                            novo_valor = st.number_input("Valor Hora (R$)", 0.0, 1000.0,
+                                                         float(op_edit.get("valor_hora_contrato", 130.0)), 5.0)
                         c3, c4 = st.columns(2)
                         novas_presencas = c3.number_input("Presenças", 0, 500, int(op_edit.get("presencas", 0)))
                         novas_faltas = c4.number_input("Faltas", 0, 100, int(op_edit.get("faltas", 0)))
 
-                        if st.form_submit_button("💾 Salvar Alterações do Estudante", type="primary", **W):
+                        if st.form_submit_button("💾 Salvar", type="primary", **W):
+                            antes = {"nome": d_edit.get("nome"),
+                                     "escola": d_edit.get("escola"),
+                                     "responsaveis": d_edit.get("responsaveis"),
+                                     "contato": d_edit.get("contato")}
                             d_edit["nome"] = novo_nome.strip()
                             d_edit["modalidade"] = nova_mod
                             if nova_mod not in d_edit.get("modalidades", []):
@@ -1440,23 +1562,29 @@ def view_diretorio(aluno, perfil, usuario):
                             d_edit["objetivo_estudante"] = novo_obj.strip()
                             d_edit["responsaveis"] = novo_resp.strip()
                             d_edit["contato"] = novo_ct.strip()
-
                             op_edit["horas_contratadas"] = float(novas_contratadas)
                             op_edit["horas_realizadas"] = float(novas_realizadas)
                             op_edit["valor_hora_contrato"] = float(novo_valor)
                             op_edit["presencas"] = int(novas_presencas)
                             op_edit["faltas"] = int(novas_faltas)
-
-                            auditar("diretorio_aluno_editado", f"{alvo_aluno} {novo_nome}")
-                            _salvar_e_recarregar(f"Cadastro de {novo_nome} atualizado com sucesso!")
+                            depois = {"nome": d_edit.get("nome"),
+                                      "escola": d_edit.get("escola"),
+                                      "responsaveis": d_edit.get("responsaveis"),
+                                      "contato": d_edit.get("contato")}
+                            auditar("diretorio_aluno_editado", f"{alvo_aluno} {novo_nome}",
+                                    valor_antes=json.dumps(antes, ensure_ascii=False),
+                                    valor_depois=json.dumps(depois, ensure_ascii=False))
+                            _salvar_e_recarregar(f"Cadastro de {novo_nome} atualizado!")
         else:
             st.info("Nenhum estudante matriculado.")
 
     with t2:
         msgs = DB().get("mensagens_familias", [])
         rows_f = [{"Aluno": a["dados"]["nome"], "Matrícula": aid,
-                   "Responsáveis": a["dados"].get("responsaveis", ""), "Contato": a["dados"].get("contato", "N/D"),
-                   "Mensagens": sum(1 for m in msgs if m.get("aluno_id") == aid)} for aid, a in alunos.items()]
+                   "Responsáveis": a["dados"].get("responsaveis", ""),
+                   "Contato": a["dados"].get("contato", "N/D"),
+                   "Mensagens": sum(1 for m in msgs if m.get("aluno_id") == aid)}
+                  for aid, a in alunos.items()]
         if rows_f:
             st.dataframe(pd.DataFrame(rows_f), hide_index=True, **W)
         else:
@@ -1466,17 +1594,23 @@ def view_diretorio(aluno, perfil, usuario):
         profs = DB().get("professores", [])
         rows_p = []
         for p in profs:
-            ats = [s for al in alunos.values() for s in al.get("atendimentos_processo", []) if s.get("professor") == p["nome"]]
+            ats = [s for al in alunos.values()
+                   for s in al.get("atendimentos_processo", [])
+                   if s.get("professor") == p["nome"]]
             horas = sum(s.get("duracao_h", 1.5) for s in ats)
-            rows_p.append({"Código": p["id"], "Nome": p["nome"], "Disciplina": p["disciplina"], "Contato": p["contato"],
-                           "Valor Hora": f"R$ {p.get('valor_hora', 90):.2f}", "Atendimentos": len(ats),
-                           "Horas": f"{horas:.1f}h"})
+            rows_p.append({"Código": p["id"], "Nome": p["nome"],
+                           "Disciplina": p["disciplina"], "Contato": p["contato"],
+                           "Valor Hora": f"R$ {p.get('valor_hora', 90):.2f}",
+                           "Atendimentos": len(ats), "Horas": f"{horas:.1f}h"})
         if rows_p:
             st.dataframe(pd.DataFrame(rows_p), hide_index=True, **W)
         else:
             st.info("Nenhum professor cadastrado.")
 
 
+# ==============================================================================
+# CAD PROFESSOR
+# ==============================================================================
 def view_cad_professor(aluno, perfil, usuario):
     st.title("Cadastro de Novo Professor / Tutor")
     profs = DB()["professores"]
@@ -1485,7 +1619,7 @@ def view_cad_professor(aluno, perfil, usuario):
     with st.form("form_cad_professor", clear_on_submit=True):
         a, b = st.columns(2)
         with a:
-            st.text_input("Código do Docente", value=prox, disabled=True)
+            st.text_input("Código", value=prox, disabled=True)
             nome = st.text_input("Nome Completo")
             disc = st.selectbox("Disciplina Principal", disciplinas_disponiveis())
             contato = st.text_input("Telefone / WhatsApp", placeholder="(81) 98888-7777")
@@ -1498,18 +1632,25 @@ def view_cad_professor(aluno, perfil, usuario):
             if not nome.strip() or not login:
                 st.error("Preencha nome e login.")
             elif login in DB()["usuarios"]:
-                st.error("Este login já existe.")
+                st.error("Login já existe.")
             elif erro:
                 st.error(erro)
             else:
-                profs.append({"id": prox, "nome": nome.strip(), "disciplina": disc, "valor_hora": float(valor),
-                            "contato": contato.strip() or "(81) 99999-0000"})
-                DB()["usuarios"][login] = {"nome": nome.strip(), "hash_senha": gerar_hash(senha),
-                                           "perfil": "professor", "aluno_vinculado": None, "trocar_senha": True}
+                profs.append({"id": prox, "nome": nome.strip(), "disciplina": disc,
+                              "valor_hora": float(valor),
+                              "contato": contato.strip() or "(81) 99999-0000"})
+                DB()["usuarios"][login] = {"nome": nome.strip(),
+                                           "hash_senha": gerar_hash(senha),
+                                           "perfil": "professor",
+                                           "aluno_vinculado": None,
+                                           "trocar_senha": True}
                 auditar("professor_cadastrado", f"{prox} {login}")
                 _salvar_e_recarregar(f"Professor cadastrado. Login '{login}' ativado.")
 
 
+# ==============================================================================
+# COCKPIT
+# ==============================================================================
 def view_cockpit(aluno, perfil, usuario):
     d = aluno["dados"]
     st.title(f"Relatório do Acompanhamento — {d['nome']}")
@@ -1517,15 +1658,12 @@ def view_cockpit(aluno, perfil, usuario):
     diarios = aluno.get("autoavaliacoes_estudante", [])
     if diarios:
         ud = sorted(diarios, key=lambda x: x.get("data", ""))[-1]
-        tarefa_txt = esc(str(ud.get("tarefa", "Não informada")))
-        sentimento_txt = esc(str(ud.get("sentimento", "Não informado")))
-        duvida_txt = esc(str(ud.get("duvida", "Sem dúvidas registradas")))
-        data_txt = esc(str(ud.get("data", "")))
-
         card("card-diario-pauta",
-             f"<h4 style='color:#1E3A8A;margin:0 0 6px 0;'>📥 Pauta Herdada (Dúvida do Aluno - {data_txt})</h4>"
-             f"<p style='margin:2px 0;'><strong>Tarefa:</strong> {tarefa_txt} (<em>{sentimento_txt}</em>)</p>"
-             f"<p style='margin:2px 0;color:#b91c1c;'><strong>Dúvida:</strong> \"{duvida_txt}\"</p>")
+             f"<h4 style='color:#1E3A8A;margin:0 0 6px 0;'>📥 Pauta Herdada ({esc(str(ud.get('data', '')))})</h4>"
+             f"<p style='margin:2px 0;'><strong>Tarefa:</strong> {esc(str(ud.get('tarefa', 'Não informada')))} "
+             f"(<em>{esc(str(ud.get('sentimento', '')))}</em>)</p>"
+             f"<p style='margin:2px 0;color:#b91c1c;'><strong>Dúvida:</strong> "
+             f"\"{esc(str(ud.get('duvida', 'Sem dúvidas')))}</p>")
 
     venc = ciclos_vencidos(aluno)
     if venc:
@@ -1533,7 +1671,7 @@ def view_cockpit(aluno, perfil, usuario):
 
     pend = [c for c in aluno.get("ciclos_intervencao", []) if "Fechado" not in c["status"]]
     if pend:
-        st.markdown("### ⚠️ Intervenções em Aberto para Validação")
+        st.markdown("### ⚠️ Intervenções em Aberto")
         for cp in pend:
             with st.expander(f"📌 {cp['id']} — {esc(cp['habilidade_cod'])} ({esc(cp['tema'])}) • limite {cp.get('data_limite', '—')}", expanded=True):
                 st.write(f"**Ação Prescrita:** {esc(cp.get('acao_prescrita', '—'))}")
@@ -1548,12 +1686,13 @@ def view_cockpit(aluno, perfil, usuario):
                         "habilidade_cod": cp["habilidade_cod"], "tema": cp["tema"],
                         "d7_data": str(date.today() + timedelta(days=7)), "d7_status": "Pendente",
                         "d30_data": str(date.today() + timedelta(days=30)), "d30_status": "Pendente"})
-                    notificar(d["id"], "⏳ Revisões programadas", f"Revisões D+7 e D+30 agendadas para {cp['tema']}.")
+                    notificar(d["id"], "⏳ Revisões programadas",
+                              f"D+7 e D+30 agendadas para {cp['tema']}.")
                     auditar("ciclo_fechado", f"{d['id']} {cp['id']}")
-                    _salvar_e_recarregar("Ciclo fechado com sucesso!")
-                if b2.button("🔄 Redesenhar Abordagem", key=f"rd_{cp['id']}"):
+                    _salvar_e_recarregar("Ciclo fechado!")
+                if b2.button("🔄 Redesenhar", key=f"rd_{cp['id']}"):
                     cp["status"] = "Em Redesenho Didático"
-                    _salvar_e_recarregar("Abordagem marcada para redesenho.")
+                    _salvar_e_recarregar("Marcado para redesenho.")
         st.divider()
 
     st.subheader("📝 Lançamento do Acompanhamento")
@@ -1563,9 +1702,13 @@ def view_cockpit(aluno, perfil, usuario):
         f1, f2 = st.columns(2)
         with f1:
             dt = st.date_input("Data", date.today())
-            profs = [p["nome"] for p in DB()["professores"]]
-            idx = profs.index(usuario["nome"]) if usuario["nome"] in profs else 0
-            prof = st.selectbox("Mediador", profs, index=idx)
+            if perfil == Perfil.PROFESSOR:
+                prof = usuario["nome"]
+                st.text_input("Mediador (fixo)", value=prof, disabled=True)
+            else:
+                profs = [p["nome"] for p in DB()["professores"]]
+                idx = profs.index(usuario["nome"]) if usuario["nome"] in profs else 0
+                prof = st.selectbox("Mediador", profs, index=idx)
             dur = st.number_input("Duração (horas)", 0.25, 6.0, 1.5, 0.25)
         with f2:
             tema = st.text_input("Tema / Situação-Problema *")
@@ -1574,32 +1717,31 @@ def view_cockpit(aluno, perfil, usuario):
 
         st.markdown("---")
         habs_sel = st.multiselect(
-            "Habilidades Foco * (Selecione uma ou mais)",
+            "Habilidades Foco *",
             [h["codigo"] for h in habs],
-            format_func=lambda x: f"{x} - {next((h['descricao'][:45] for h in habs if h['codigo'] == x), '')}..."
+            format_func=lambda x: f"{x} - {next((h['descricao'][:45] for h in habs if h['codigo'] == x), '')}...",
         )
-
         blocos_sel = st.multiselect(
-            "Blocos SOS * (Selecione um ou mais)",
+            "Blocos SOS *",
             list(TOPICOS_SOS),
-            format_func=lambda x: f"{x} - {TOPICOS_SOS[x].nome}"
+            format_func=lambda x: f"{x} - {TOPICOS_SOS[x].nome}",
         )
-
         obstaculos_sel = st.multiselect(
-            "Obstáculos Principais * (Selecione um ou mais)",
+            "Obstáculos Principais *",
             list(TAXONOMIA_ERRO_PEDAGOGICO),
-            default=["Modelagem"]
+            default=["Modelagem"],
         )
-
         st.markdown("---")
-        presc = st.text_area("Recomendação para o Estudante *", "Resolver ficha estruturante correspondente.")
-        obs_fam = st.text_area("Recomendações para a família", "Incentivar a resolução espaçada ao longo da semana.")
+        presc = st.text_area("Recomendação para o Estudante *",
+                             "Resolver ficha estruturante correspondente.")
+        obs_fam = st.text_area("Recomendações para a família",
+                               "Incentivar a resolução espaçada.")
+        st.markdown("📎 **Anexar Ficha (Opcional)**")
+        ficha_anexo = st.file_uploader("Arquivo PDF:", type=["pdf"], key="ficha_atendimento_upload")
+        ficha_titulo = st.text_input("Título da Ficha:",
+                                     placeholder="Ex: Ficha SOS #05 - Treino Guiado")
 
-        st.markdown("📎 **Anexar Ficha de Estudo para o Aluno (Opcional):**")
-        ficha_anexo = st.file_uploader("Arquivo da Ficha (PDF):", type=["pdf"], key="ficha_atendimento_upload")
-        ficha_titulo = st.text_input("Título da Ficha de Estudo (caso anexe arquivo):", placeholder="Ex: Ficha SOS #05 - Treino Guiado")
-
-        if st.form_submit_button("Gravar Relatório de Acompanhamento", type="primary", **W):
+        if st.form_submit_button("Gravar Relatório", type="primary", **W):
             if not tema.strip():
                 st.error("Informe o tema da sessão.")
             elif not habs_sel:
@@ -1607,39 +1749,32 @@ def view_cockpit(aluno, perfil, usuario):
             elif not blocos_sel:
                 st.error("Selecione ao menos um Bloco SOS.")
             elif not obstaculos_sel:
-                st.error("Selecione ao menos um Obstáculo Principal.")
+                st.error("Selecione ao menos um Obstáculo.")
             else:
                 if ficha_anexo:
+                    erro_arq = validar_upload_magic(ficha_anexo)
+                    if erro_arq:
+                        st.error(f"❌ {erro_arq}")
+                        st.stop()
                     tit_f = ficha_titulo.strip() or f"Ficha - {tema.strip()}"
                     nome_arq_ficha = salvar_upload(ficha_anexo, PASTA_FICHAS, d["id"])
                     aluno["fichas_disponibilizadas"].append({
-                        "nome_arquivo": nome_arq_ficha,
-                        "titulo": tit_f,
-                        "data_upload": str(date.today()),
-                        "uploaded_by": prof
+                        "nome_arquivo": nome_arq_ficha, "titulo": tit_f,
+                        "data_upload": str(date.today()), "uploaded_by": prof,
                     })
                     notificar(d["id"], "📄 Nova ficha disponível", tit_f, origem="professor")
                     auditar("ficha_publicada_via_relatorio", f"{d['id']} {nome_arq_ficha}")
 
                 novo_at = {
-                    "id": novo_id("SESS"),
-                    "data": str(dt),
-                    "professor": prof,
-                    "habilidades_cod": habs_sel,
-                    "habilidade_cod": ", ".join(habs_sel),
-                    "topicos_sos": blocos_sel,
-                    "topico_sos": ", ".join(blocos_sel),
+                    "id": novo_id("SESS"), "data": str(dt), "professor": prof,
+                    "habilidades_cod": habs_sel, "habilidade_cod": ", ".join(habs_sel),
+                    "topicos_sos": blocos_sel, "topico_sos": ", ".join(blocos_sel),
                     "tema": tema.strip(),
-                    "tipos_erro": obstaculos_sel,
-                    "tipo_erro": ", ".join(obstaculos_sel),
-                    "avaliacao_pre": pre,
-                    "avaliacao_pos": pos,
-                    "ganho_ipsativo": pos - pre,
-                    "duracao_h": float(dur),
-                    "observacao": obs_fam.strip(),
-                    "prescricao": presc.strip()
+                    "tipos_erro": obstaculos_sel, "tipo_erro": ", ".join(obstaculos_sel),
+                    "avaliacao_pre": pre, "avaliacao_pos": pos,
+                    "ganho_ipsativo": pos - pre, "duracao_h": float(dur),
+                    "observacao": obs_fam.strip(), "prescricao": presc.strip(),
                 }
-
                 aluno["atendimentos_processo"].append(novo_at)
 
                 if pos < 70.0:
@@ -1654,31 +1789,45 @@ def view_cockpit(aluno, perfil, usuario):
                         "data_abertura": str(dt),
                         "data_limite": str(dt + timedelta(days=14)),
                         "status": "Em Andamento (Aguardando Reavaliação)",
-                        "historico_fechamento": None
+                        "historico_fechamento": None,
                     })
 
                 aluno["operacao"]["horas_realizadas"] += float(dur)
                 aluno["operacao"]["presencas"] += 1
                 auditar("atendimento_lancado", f"{d['id']} {tema.strip()} {dur}h")
-                _salvar_e_recarregar("Relatório de Acompanhamento gravado com sucesso!")
+                _salvar_e_recarregar("Relatório gravado!")
 
 
+# ==============================================================================
+# UPLOAD FICHAS / FICHAS ALUNO
+# ==============================================================================
 def view_upload_fichas(aluno, perfil, usuario):
     d = aluno["dados"]
     st.title(f"Gestão de Fichas — {d['nome']}")
     with st.form("form_upload_ficha", clear_on_submit=True):
         tit = st.text_input("Título da Ficha")
-        profs = [p["nome"] for p in DB()["professores"]]
-        resp = st.selectbox("Professor Responsável:", profs, index=profs.index(usuario["nome"]) if usuario["nome"] in profs else 0)
+        if perfil == Perfil.PROFESSOR:
+            resp = usuario["nome"]
+            st.text_input("Responsável (fixo)", value=resp, disabled=True)
+        else:
+            profs = [p["nome"] for p in DB()["professores"]]
+            resp = st.selectbox("Professor Responsável:", profs,
+                                index=profs.index(usuario["nome"]) if usuario["nome"] in profs else 0)
         arq = st.file_uploader("Arquivo PDF:", type=["pdf"])
         if st.form_submit_button("Publicar Ficha"):
             if tit.strip() and arq:
-                nome = salvar_upload(arq, PASTA_FICHAS, d["id"])
-                aluno["fichas_disponibilizadas"].append({"nome_arquivo": nome, "titulo": tit.strip(),
-                                                         "data_upload": str(date.today()), "uploaded_by": resp})
-                notificar(d["id"], "📄 Nova ficha disponível", tit.strip(), origem="professor")
-                auditar("ficha_publicada", f"{d['id']} {nome}")
-                _salvar_e_recarregar("Ficha publicada!")
+                erro_arq = validar_upload_magic(arq)
+                if erro_arq:
+                    st.error(f"❌ {erro_arq}")
+                else:
+                    nome = salvar_upload(arq, PASTA_FICHAS, d["id"])
+                    aluno["fichas_disponibilizadas"].append({
+                        "nome_arquivo": nome, "titulo": tit.strip(),
+                        "data_upload": str(date.today()), "uploaded_by": resp,
+                    })
+                    notificar(d["id"], "📄 Nova ficha disponível", tit.strip(), origem="professor")
+                    auditar("ficha_publicada", f"{d['id']} {nome}")
+                    _salvar_e_recarregar("Ficha publicada!")
             else:
                 st.error("Informe o título e anexe o PDF.")
 
@@ -1694,9 +1843,12 @@ def view_fichas_aluno(aluno, perfil, usuario):
             a.markdown(f"📄 **{esc(f['titulo'])}**")
             a.caption(f"Disponibilizado por {esc(f['uploaded_by'])} em {f['data_upload']}")
             with b:
-                botao_download("⬇️ Baixar Ficha", PASTA_FICHAS, f["nome_arquivo"], f"dl_{i}")
+                botao_download("⬇️ Baixar", PASTA_FICHAS, f["nome_arquivo"], f"dl_{i}")
 
 
+# ==============================================================================
+# PERFIL ALUNO
+# ==============================================================================
 def view_perfil_aluno(aluno, perfil, usuario):
     d = aluno["dados"]
     st.title(f"Perfil do Estudante — {esc(d['nome'])}")
@@ -1707,20 +1859,28 @@ def view_perfil_aluno(aluno, perfil, usuario):
             st.write(f"**Modalidades:** {esc(', '.join(d.get('modalidades', [d.get('modalidade', '')])))}")
             st.write(f"**Escola / Série:** {esc(d.get('escola', ''))} ({esc(d.get('serie', ''))})")
             st.write(f"**Objetivo:** {esc(d.get('objetivo_estudante', ''))}")
-            st.write(f"**Banca de Referência:** `{esc(d.get('banca_foco', '—'))}`")
     with t2:
         with st.form("form_envio", clear_on_submit=True):
-            tit = st.text_input("Identificação do Material", placeholder="Ex: Resolução Ficha #04 - Q1 a 10")
+            tit = st.text_input("Identificação do Material",
+                                placeholder="Ex: Resolução Ficha #04 - Q1 a 10")
             com = st.text_area("Observações sobre a ficha:")
-            arq = st.file_uploader("Arquivo (PDF ou imagem):", type=["pdf", "png", "jpg", "jpeg"])
+            arq = st.file_uploader("Arquivo (PDF ou imagem):",
+                                   type=["pdf", "png", "jpg", "jpeg"])
             if st.form_submit_button("Enviar Material"):
                 if tit.strip() and arq:
-                    nome = salvar_upload(arq, PASTA_ENVIOS_ALUNOS, d["id"])
-                    aluno["materiais_enviados_aluno"].append({
-                        "id": novo_id("ENV"), "data": str(date.today()), "titulo": tit.strip(), "arquivo": nome,
-                        "comentario": com, "status": "Recebido pelo Professor", "devolutiva": ""})
-                    auditar("material_enviado", f"{d['id']} {nome}")
-                    _salvar_e_recarregar("Material enviado!")
+                    erro_arq = validar_upload_magic(arq)
+                    if erro_arq:
+                        st.error(f"❌ {erro_arq}")
+                    else:
+                        nome = salvar_upload(arq, PASTA_ENVIOS_ALUNOS, d["id"])
+                        aluno["materiais_enviados_aluno"].append({
+                            "id": novo_id("ENV"), "data": str(date.today()),
+                            "titulo": tit.strip(), "arquivo": nome,
+                            "comentario": com, "status": "Recebido pelo Professor",
+                            "devolutiva": "",
+                        })
+                        auditar("material_enviado", f"{d['id']} {nome}")
+                        _salvar_e_recarregar("Material enviado!")
                 else:
                     st.error("Informe a identificação e anexe o arquivo.")
     with t3:
@@ -1729,7 +1889,8 @@ def view_perfil_aluno(aluno, perfil, usuario):
             df = pd.DataFrame(ats)
             df["data"] = pd.to_datetime(df["data"])
             df = df.sort_values("data")
-            fig = px.line(df, x="data", y="avaliacao_pos", markers=True, title="Aproveitamento Pós-Mediação (%)",
+            fig = px.line(df, x="data", y="avaliacao_pos", markers=True,
+                          title="Aproveitamento Pós-Mediação (%)",
                           labels={"avaliacao_pos": "Acerto (%)", "data": "Data"})
             fig.update_traces(line_color="#1E3A8A", line_width=3)
             fig.update_yaxes(range=[0, 105])
@@ -1752,16 +1913,18 @@ def view_materiais_alunos(aluno, perfil, usuario):
             st.markdown(f"**{esc(e['titulo'])}** — {e['data']}")
             if e.get("comentario"):
                 st.caption(f"Obs. do aluno: {esc(e['comentario'])}")
-            botao_download("⬇️ Baixar arquivo", PASTA_ENVIOS_ALUNOS, e["arquivo"], f"dle_{e['id']}")
+            botao_download("⬇️ Baixar", PASTA_ENVIOS_ALUNOS, e["arquivo"], f"dle_{e['id']}")
             c1, c2 = st.columns([1, 2])
-            novo = c1.selectbox("Status", estados, index=estados.index(e["status"]) if e["status"] in estados else 0,
+            novo = c1.selectbox("Status", estados,
+                                index=estados.index(e["status"]) if e["status"] in estados else 0,
                                 key=f"st_{e['id']}")
             dev = c2.text_input("Devolutiva", e["devolutiva"], key=f"dv_{e['id']}")
             if st.button("Salvar", key=f"sv_{e['id']}"):
                 mudou = novo != e["status"]
                 e["status"], e["devolutiva"] = novo, dev
                 if mudou:
-                    notificar(d["id"], "📥 Material atualizado", f"'{e['titulo']}': {novo}", origem="professor")
+                    notificar(d["id"], "📥 Material atualizado",
+                              f"'{e['titulo']}': {novo}", origem="professor")
                 _salvar_e_recarregar("Alterações salvas!")
 
 
@@ -1769,8 +1932,9 @@ def view_diario(aluno, perfil, usuario):
     st.title("Diário de Bordo: Minha Reflexão de Estudo")
     with st.form("form_diario", clear_on_submit=True):
         tarefa = st.text_input("Qual lista ou ficha você resolveu hoje?")
-        sent = st.select_slider("Como você se sentiu?", ["Muito travado / Inseguro", "Com dúvidas, mas tentei",
-                                                        "Confiante na maioria", "Pleno domínio"])
+        sent = st.select_slider("Como você se sentiu?",
+                                ["Muito travado / Inseguro", "Com dúvidas, mas tentei",
+                                 "Confiante na maioria", "Pleno domínio"])
         aten = st.number_input("Erros por pura distração:", 0, 20, 1)
         res = st.text_area("Onde você travou e precisou ver a resolução?")
         duv = st.text_area("Pergunta para o professor responder na aula:")
@@ -1780,8 +1944,10 @@ def view_diario(aluno, perfil, usuario):
                 st.error("Informe a tarefa estudada.")
             else:
                 aluno["autoavaliacoes_estudante"].append({
-                    "data": str(date.today()), "tarefa": tarefa.strip(), "sentimento": sent, "erros_atencao": aten,
-                    "consultou_gabarito": res, "duvida": duv, "estrategia": est})
+                    "data": str(date.today()), "tarefa": tarefa.strip(),
+                    "sentimento": sent, "erros_atencao": aten,
+                    "consultou_gabarito": res, "duvida": duv, "estrategia": est,
+                })
                 _salvar_e_recarregar("Reflexão gravada!")
 
 
@@ -1796,15 +1962,19 @@ def view_revisoes(aluno, perfil, usuario):
     def rotulo(status, dt):
         if status == "Concluída":
             return "🟢 Concluída"
-        return "🔴 Fazer hoje / atrasada" if datetime.strptime(dt, "%Y-%m-%d").date() <= hoje else f"🟡 Programada ({dt})"
+        return ("🔴 Fazer hoje / atrasada"
+                if datetime.strptime(dt, "%Y-%m-%d").date() <= hoje
+                else f"🟡 Programada ({dt})")
 
     for i, r in enumerate(revs):
         with st.container(border=True):
             st.markdown(f"**{esc(r['tema'])}**")
             c1, c2 = st.columns(2)
-            for col, chave, nome in [(c1, "d7", "Revisão rápida D+7"), (c2, "d30", "Simulado D+30")]:
+            for col, chave, nome in [(c1, "d7", "Revisão rápida D+7"),
+                                     (c2, "d30", "Simulado D+30")]:
                 col.write(f"{nome}: {rotulo(r[chave + '_status'], r[chave + '_data'])}")
-                if r[chave + "_status"] != "Concluída" and col.button("Marcar como concluída", key=f"rv_{i}_{chave}"):
+                if r[chave + "_status"] != "Concluída" and col.button(
+                        "Marcar como concluída", key=f"rv_{i}_{chave}"):
                     r[chave + "_status"] = "Concluída"
                     _salvar_e_recarregar("Revisão concluída!")
 
@@ -1826,15 +1996,14 @@ def view_relatorio_familia(aluno, perfil, usuario):
         </div>
         <p><strong>Estudante:</strong> <span style="color:#1E3A8A;">{esc(d['nome'])}</span> &nbsp;|&nbsp; <strong>Matrícula:</strong> <code>{esc(d['id'])}</code></p>
         <p><strong>Responsáveis:</strong> {esc(d.get('responsaveis', 'Família'))} &nbsp;|&nbsp; <strong>Escola/Série:</strong> {esc(str(d.get('escola')))} ({esc(str(d.get('serie')))})</p>
-        <p><strong>Foco:</strong> {esc(d.get('objetivo_estudante', ''))} &nbsp;|&nbsp; <strong>Banca:</strong> {esc(d.get('banca_foco', ''))}</p>
         <hr style="border:0;border-top:1px solid #e2e8f0;margin:16px 0;">
-        <h4 style="color:#1E3A8A;">1. Indicadores Operacionais &amp; Evolução</h4>
+        <h4 style="color:#1E3A8A;">1. Indicadores Operacionais</h4>
         <ul>
             <li><strong>Carga horária:</strong> {op['horas_realizadas']:.1f}h de {op['horas_contratadas']:.1f}h ({op['presencas']} encontros; {op['faltas']} falta(s)).</li>
-            <li><strong>Ciclos fechados com sucesso:</strong> {fechados}.</li>
+            <li><strong>Ciclos fechados:</strong> {fechados}.</li>
             <li><strong>Diários metacognitivos:</strong> {len(aluno.get('autoavaliacoes_estudante', []))} registros.</li>
         </ul>
-        <h4 style="color:#1E3A8A;">2. Parecer Técnico da Coordenação Pedagógica</h4>
+        <h4 style="color:#1E3A8A;">2. Parecer Técnico</h4>
         <p style="font-style:italic;color:#334155;line-height:1.6;">"{esc(parecer)}"</p>
         <p style="text-align:right;color:#64748b;font-size:.85rem;">Coordenação Pedagógica SOS Exatas — {datetime.now().strftime('%d/%m/%Y')}</p>
     """)
@@ -1844,13 +2013,16 @@ def view_mensagens_familia(aluno, perfil, usuario):
     d = aluno["dados"]
     st.title("Canal Direto com a Coordenação")
     with st.form("form_msg", clear_on_submit=True):
-        rem = st.text_input("Seu Nome:", d.get("responsaveis", "Família"))
+        rem = usuario.get("nome") or d.get("responsaveis", "Família")
+        st.text_input("Remetente", value=rem, disabled=True)
         msg = st.text_area("Mensagem:")
         if st.form_submit_button("Enviar Mensagem"):
             if msg.strip():
-                DB()["mensagens_familias"].append({"id": novo_id("MSG"), "data": str(date.today()),
-                                                   "aluno_id": d["id"], "remetente": rem, "mensagem": msg,
-                                                   "respondida": False, "respostas": []})
+                DB()["mensagens_familias"].append({
+                    "id": novo_id("MSG"), "data": str(date.today()),
+                    "aluno_id": d["id"], "remetente": rem, "mensagem": msg,
+                    "respondida": False, "respostas": [],
+                })
                 _salvar_e_recarregar("Mensagem enviada!")
             else:
                 st.error("Escreva uma mensagem.")
@@ -1858,9 +2030,11 @@ def view_mensagens_familia(aluno, perfil, usuario):
     st.subheader("Histórico")
     for m in reversed(DB().get("mensagens_familias", [])):
         if m.get("aluno_id") == d["id"]:
-            card("card-comunicado", f"<strong style='color:#1E3A8A;'>{esc(m['remetente'])}</strong> ({esc(m['data'])}):<br>{esc(m['mensagem'])}")
+            card("card-comunicado",
+                 f"<strong style='color:#1E3A8A;'>{esc(m['remetente'])}</strong> ({esc(m['data'])}):<br>{esc(m['mensagem'])}")
             for r in m.get("respostas", []):
-                card("card-diario-pauta", f"<strong>↳ {esc(r['autor'])}</strong> ({esc(r['data'])}):<br>{esc(r['texto'])}")
+                card("card-diario-pauta",
+                     f"<strong>↳ {esc(r['autor'])}</strong> ({esc(r['data'])}):<br>{esc(r['texto'])}")
 
 
 def view_painel360(aluno, perfil, usuario):
@@ -1868,48 +2042,49 @@ def view_painel360(aluno, perfil, usuario):
     saldo = op["horas_contratadas"] - op["horas_realizadas"]
     financeiro = pode(perfil, "gerenciar_matriz")
     if financeiro and saldo <= 3.0:
-        card("card-renovacao", f"<h3 style='margin:0 0 6px 0;'>🚨 ALERTA COMERCIAL: RENOVAÇÃO NECESSÁRIA</h3>"
-                               f"<strong>{esc(d['nome'])}</strong> consumiu <strong>{op['horas_realizadas']:.1f}h</strong> de "
-                               f"<strong>{op['horas_contratadas']:.1f}h</strong>. Restam <strong>{saldo:.1f}h</strong>.")
+        card("card-renovacao",
+             f"<h3 style='margin:0 0 6px 0;'>🚨 ALERTA COMERCIAL: RENOVAÇÃO NECESSÁRIA</h3>"
+             f"<strong>{esc(d['nome'])}</strong> consumiu <strong>{op['horas_realizadas']:.1f}h</strong> "
+             f"de <strong>{op['horas_contratadas']:.1f}h</strong>. Restam <strong>{saldo:.1f}h</strong>.")
     venc = ciclos_vencidos(aluno)
     if venc:
         st.warning(f"⏰ Ciclos com prazo vencido: {', '.join(c['id'] for c in venc)}")
-
     st.title(f"Painel 360° — {esc(d['nome'])}")
     with st.container(border=True):
         c1, c2, c3 = st.columns(3)
-        c1.metric("Horas Realizadas", f"{op['horas_realizadas']:.1f} h", delta=f"{saldo:.1f}h restantes")
-        c2.metric("Presenças / Faltas", f"{op['presencas']} presentes", delta=f"{op['faltas']} faltas", delta_color="inverse")
+        c1.metric("Horas Realizadas", f"{op['horas_realizadas']:.1f} h",
+                  delta=f"{saldo:.1f}h restantes")
+        c2.metric("Presenças / Faltas", f"{op['presencas']} presentes",
+                  delta=f"{op['faltas']} faltas", delta_color="inverse")
         if financeiro:
-            c3.metric("Valor do Contrato", f"R$ {op['horas_contratadas'] * op.get('valor_hora_contrato', 130.0):,.2f}")
+            c3.metric("Valor do Contrato",
+                      f"R$ {op['horas_contratadas'] * op.get('valor_hora_contrato', 130.0):,.2f}")
 
 
 def view_intervencoes(aluno, perfil, usuario):
     st.title("Relatório das Aulas Anteriores")
     ciclos = aluno.get("ciclos_intervencao", [])
     atendimentos = aluno.get("atendimentos_processo", [])
-
-    t1, t2 = st.tabs(["📋 Histórico das Aulas Anteriores", "🛠️ Ciclos de Intervenção Pedagógica"])
+    t1, t2 = st.tabs(["📋 Histórico", "🛠️ Ciclos de Intervenção"])
 
     with t1:
         if not atendimentos:
-            st.info("Nenhuma aula anterior registrada para este estudante.")
+            st.info("Nenhuma aula anterior registrada.")
         else:
             for at in reversed(atendimentos):
                 ganho = at.get("ganho_ipsativo", 0.0)
                 obs_list = at.get("tipos_erro") or [at.get("tipo_erro", "—")]
                 habs_list = at.get("habilidades_cod") or [at.get("habilidade_cod", "—")]
                 blocos_list = at.get("topicos_sos") or [at.get("topico_sos", "—")]
-
                 card("card-diario-pauta", f"""
                     <div style="display:flex;justify-content:space-between;align-items:center;">
                         <h4 style="color:#1E3A8A;margin:0;">📅 {esc(at.get('data', ''))} — {esc(at.get('tema', 'Sem tema'))}</h4>
                         <span style="font-weight:700;color:#D97706;">Duração: {at.get('duracao_h', 1.5):.2f}h</span>
                     </div>
-                    <p style="margin:4px 0;"><strong>Mediador:</strong> {esc(at.get('professor', '—'))} &nbsp;|&nbsp; <strong>Habilidades:</strong> <code>{esc(", ".join(habs_list))}</code> (Blocos: <em>{esc(", ".join(blocos_list))}</em>)</p>
-                    <p style="margin:4px 0;"><strong>Obstáculos Identificados:</strong> <span style="color:#b91c1c;font-weight:600;">{esc(", ".join(obs_list))}</span></p>
-                    <p style="margin:4px 0;"><strong>Desempenho Pré:</strong> {at.get('avaliacao_pre', 0):.0f}% &nbsp;|&nbsp; <strong>Pós:</strong> {at.get('avaliacao_pos', 0):.0f}% &nbsp;|&nbsp; <strong>Ganho:</strong> <span style="color:{'#15803d' if ganho >= 0 else '#b91c1c'};font-weight:700;">{ganho:+.0f} p.p.</span></p>
-                    <p style="margin:4px 0;background:#fff;padding:8px;border-radius:6px;border:1px solid #bfdbfe;"><strong>Recomendação para o Estudante:</strong> {esc(at.get('prescricao', '—'))}</p>
+                    <p style="margin:4px 0;"><strong>Mediador:</strong> {esc(at.get('professor', '—'))} &nbsp;|&nbsp; <strong>Habilidades:</strong> <code>{esc(", ".join(habs_list))}</code></p>
+                    <p style="margin:4px 0;"><strong>Obstáculos:</strong> <span style="color:#b91c1c;font-weight:600;">{esc(", ".join(obs_list))}</span></p>
+                    <p style="margin:4px 0;"><strong>Pré:</strong> {at.get('avaliacao_pre', 0):.0f}% &nbsp;|&nbsp; <strong>Pós:</strong> {at.get('avaliacao_pos', 0):.0f}% &nbsp;|&nbsp; <strong>Ganho:</strong> <span style="color:{'#15803d' if ganho >= 0 else '#b91c1c'};font-weight:700;">{ganho:+.0f} p.p.</span></p>
+                    <p style="margin:4px 0;background:#fff;padding:8px;border-radius:6px;border:1px solid #bfdbfe;"><strong>Recomendação:</strong> {esc(at.get('prescricao', '—'))}</p>
                 """)
 
     with t2:
@@ -1922,14 +2097,20 @@ def view_intervencoes(aluno, perfil, usuario):
                  f"<strong style='color:#D97706;'>{esc(c['id'])} — [{esc(c['habilidade_cod'])}] {esc(c['tema'])}</strong> "
                  f"({esc(c['status'])}){' ⏰ <b>VENCIDO</b>' if atrasado else ''}<br>"
                  f"<strong>Diagnóstico:</strong> {esc(c['motivo_abertura'])}<br>"
-                 f"<strong>Prescrição:</strong> {esc(c['acao_prescrita'])}<br><strong>Prazo:</strong> {esc(c.get('data_limite', '—'))}")
+                 f"<strong>Prescrição:</strong> {esc(c['acao_prescrita'])}<br>"
+                 f"<strong>Prazo:</strong> {esc(c.get('data_limite', '—'))}")
 
 
 def view_docs_coord(aluno, perfil, usuario):
     st.title("Comunicação Docente com a Coordenação")
     with st.form("form_doc", clear_on_submit=True):
-        profs = [p["nome"] for p in DB()["professores"]]
-        rem = st.selectbox("Seu Nome:", profs, index=profs.index(usuario["nome"]) if usuario["nome"] in profs else 0)
+        if perfil == Perfil.PROFESSOR:
+            rem = usuario["nome"]
+            st.text_input("Remetente (fixo)", value=rem, disabled=True)
+        else:
+            profs = [p["nome"] for p in DB()["professores"]]
+            rem = st.selectbox("Seu Nome:", profs,
+                               index=profs.index(usuario["nome"]) if usuario["nome"] in profs else 0)
         assunto = st.text_input("Assunto")
         det = st.text_area("Descrição:")
         arq = st.file_uploader("Anexo:", type=["pdf", "png", "jpg", "docx"])
@@ -1937,9 +2118,16 @@ def view_docs_coord(aluno, perfil, usuario):
             if not assunto.strip():
                 st.error("Informe o assunto.")
             else:
+                if arq:
+                    erro_arq = validar_upload_magic(arq)
+                    if erro_arq:
+                        st.error(f"❌ {erro_arq}")
+                        st.stop()
                 nome = salvar_upload(arq, PASTA_DOCS_PROFESSORES, "DOC") if arq else None
-                DB()["docs_professores"].append({"data": str(date.today()), "professor": rem, "assunto": assunto.strip(),
-                                               "descricao": det, "arquivo": nome})
+                DB()["docs_professores"].append({
+                    "data": str(date.today()), "professor": rem,
+                    "assunto": assunto.strip(), "descricao": det, "arquivo": nome,
+                })
                 _salvar_e_recarregar("Documento enviado!")
 
 
@@ -1962,10 +2150,13 @@ def view_caixa(aluno, perfil, usuario):
                 resp = st.text_input("Responder", key=f"rp_{m['id']}")
                 if st.button("Enviar resposta", key=f"rb_{m['id']}"):
                     if resp.strip():
-                        m["respostas"].append({"autor": usuario["nome"], "data": str(date.today()), "texto": resp.strip()})
+                        m["respostas"].append({"autor": usuario["nome"],
+                                               "data": str(date.today()),
+                                               "texto": resp.strip()})
                         m["respondida"] = True
                         if m.get("aluno_id"):
-                            notificar(m["aluno_id"], "✉️ Resposta da Coordenação", resp.strip()[:200], origem="coordenacao")
+                            notificar(m["aluno_id"], "✉️ Resposta da Coordenação",
+                                      resp.strip()[:200], origem="coordenacao")
                         auditar("mensagem_respondida", m["id"])
                         _salvar_e_recarregar("Resposta enviada!")
     with t2:
@@ -1993,12 +2184,13 @@ def view_matriz(aluno, perfil, usuario):
         with st.form("form_hab"):
             a, b = st.columns(2)
             with a:
-                cod = st.text_input("Código da Habilidade", placeholder="Ex: EM13MAT315").strip().upper()
+                cod = st.text_input("Código", placeholder="Ex: EM13MAT315").strip().upper()
                 disc = st.selectbox("Disciplina", [x.value for x in Disciplina])
                 etapa = st.selectbox("Etapa", [x.value for x in Etapa])
             with b:
                 unid = st.selectbox("Unidade Temática", [x.value for x in UnidadeTematica])
-                tops = st.multiselect("Blocos SOS", list(TOPICOS_SOS), format_func=lambda x: f"{x} - {TOPICOS_SOS[x].nome}")
+                tops = st.multiselect("Blocos SOS", list(TOPICOS_SOS),
+                                      format_func=lambda x: f"{x} - {TOPICOS_SOS[x].nome}")
                 pre = st.text_input("Pré-Requisitos (vírgula)")
             desc = st.text_area("Descrição Oficial")
             if st.form_submit_button("Salvar Habilidade"):
@@ -2007,7 +2199,8 @@ def view_matriz(aluno, perfil, usuario):
                 elif any(h["codigo"] == cod for h in habs):
                     st.error("Código já cadastrado.")
                 else:
-                    habs.append({"codigo": cod, "descricao": desc.strip(), "etapa": etapa, "disciplina": disc,
+                    habs.append({"codigo": cod, "descricao": desc.strip(),
+                                 "etapa": etapa, "disciplina": disc,
                                  "unidade": unid, "topicos_sos": tops,
                                  "prerequisitos": [x.strip() for x in pre.split(",") if x.strip()]})
                     auditar("habilidade_criada", cod)
@@ -2018,10 +2211,16 @@ def view_produtividade(aluno, perfil, usuario):
     st.title("Produtividade da Equipe Pedagógica")
     rows = []
     for p in DB().get("professores", []):
-        ats = [s for al in DB()["alunos"].values() for s in al.get("atendimentos_processo", []) if s.get("professor"] == p["nome"]]
+        ats = [
+            s
+            for al in DB()["alunos"].values()
+            for s in al.get("atendimentos_processo", [])
+            if s.get("professor") == p["nome"]
+        ]
         h = sum(s.get("duracao_h", 1.5) for s in ats)
-        rows.append({"Professor": p["nome"], "Disciplina": p["disciplina"], "Aulas": len(ats),
-                     "Horas": round(h, 2), "Repasse Estimado (R$)": round(h * p.get("valor_hora", 90), 2)})
+        rows.append({"Professor": p["nome"], "Disciplina": p["disciplina"],
+                     "Aulas": len(ats), "Horas": round(h, 2),
+                     "Repasse Estimado (R$)": round(h * p.get("valor_hora", 90), 2)})
     st.dataframe(pd.DataFrame(rows), hide_index=True, **W)
 
 
@@ -2034,15 +2233,16 @@ def view_matricula(aluno, perfil, usuario):
             mid = st.text_input("Matrícula", proximo_id_aluno(alunos)).strip().upper()
             nome = st.text_input("Nome Completo")
             mod = st.selectbox("Modalidade Principal", MODALIDADES_VALIDAS)
-            mods_adicionais = st.multiselect("Outras Modalidades Ativas", MODALIDADES_VALIDAS, default=[mod])
+            mods_adicionais = st.multiselect("Outras Modalidades", MODALIDADES_VALIDAS, default=[mod])
             esc_ = st.text_input("Escola")
-            ser = st.selectbox("Série", ["1º Ano EM", "2º Ano EM", "3º Ano EM", "Pré-Vestibular / Extensivo", "Fundamental"])
+            ser = st.selectbox("Série", ["1º Ano EM", "2º Ano EM", "3º Ano EM",
+                                         "Pré-Vestibular / Extensivo", "Fundamental"])
         with b:
             ct = st.text_input("WhatsApp")
             rp = st.text_input("Responsáveis")
             ob = st.text_input("Objetivo", "Medicina")
             hr = st.number_input("Horas Contratadas", 10.0, 200.0, 40.0, 5.0)
-            vh = st.number_input("Valor da hora do contrato (R$)", 30.0, 500.0, 130.0, 5.0)
+            vh = st.number_input("Valor da hora (R$)", 30.0, 500.0, 130.0, 5.0)
         if st.form_submit_button("Concluir Matrícula"):
             if not nome.strip():
                 st.error("Informe o nome.")
@@ -2051,37 +2251,51 @@ def view_matricula(aluno, perfil, usuario):
             else:
                 lista_mods = list(set([mod] + mods_adicionais))
                 alunos[mid] = {
-                    "dados": {"id": mid, "nome": nome.strip(), "modalidade": mod, "modalidades": lista_mods,
-                            "escola": esc_, "serie": ser, "objetivo_estudante": ob, "contato": ct,
-                            "responsaveis": rp, "data_matricula": str(date.today()), "foto_path": None, "banca_foco": ""},
+                    "dados": {"id": mid, "nome": nome.strip(), "modalidade": mod,
+                              "modalidades": lista_mods, "escola": esc_, "serie": ser,
+                              "objetivo_estudante": ob, "contato": ct, "responsaveis": rp,
+                              "data_matricula": str(date.today()),
+                              "foto_path": None, "banca_foco": ""},
                     "operacao": {"horas_contratadas": float(hr), "horas_realizadas": 0.0,
-                                 "valor_hora_contrato": float(vh), "presencas": 0, "faltas": 0},
+                                 "valor_hora_contrato": float(vh),
+                                 "presencas": 0, "faltas": 0},
                     "contratos": [],
-                    "parecer_coordenacao": "", "planejamentos_pedagogicos": [], "fichas_disponibilizadas": [],
-                    "materiais_enviados_aluno": [], "atendimentos_processo": [], "ciclos_intervencao": [],
-                    "autoavaliacoes_estudante": [], "revisoes_agendadas": []}
+                    "parecer_coordenacao": "",
+                    "planejamentos_pedagogicos": [],
+                    "fichas_disponibilizadas": [],
+                    "materiais_enviados_aluno": [],
+                    "atendimentos_processo": [],
+                    "ciclos_intervencao": [],
+                    "autoavaliacoes_estudante": [],
+                    "revisoes_agendadas": [],
+                }
                 auditar("aluno_matriculado", mid)
                 _salvar_e_recarregar("Aluno matriculado!")
 
 
 def view_exclusao(aluno, perfil, usuario):
     st.title("Exclusão e Desligamento de Alunos")
-    st.warning("⚠️ A exclusão remove atendimentos, notas, notificações e revoga os acessos vinculados.")
+    st.warning("⚠️ A exclusão remove atendimentos e revoga acessos vinculados.")
     alunos = DB()["alunos"]
     if not alunos:
         st.info("Nenhum aluno cadastrado.")
         return
-    alvo = st.selectbox("Aluno:", list(alunos), format_func=lambda x: f"{alunos[x]['dados']['nome']} ({x})")
-    conf = st.text_input(f"Digite {alvo} para confirmar a exclusão definitiva")
-    if st.button("🗑️ Excluir Aluno Definitivamente"):
+    alvo = st.selectbox("Aluno:", list(alunos),
+                        format_func=lambda x: f"{alunos[x]['dados']['nome']} ({x})")
+    conf = st.text_input(f"Digite {alvo} para confirmar")
+    if st.button("🗑️ Excluir Definitivamente"):
         if conf.strip().upper() != alvo:
             st.error("Confirmação incorreta.")
         else:
             del alunos[alvo]
-            for u in [u for u, v in DB()["usuarios"].items() if v.get("aluno_vinculado") == alvo]:
+            for u in [u for u, v in DB()["usuarios"].items()
+                      if v.get("aluno_vinculado") == alvo]:
                 del DB()["usuarios"][u]
-            for pasta in (NOTIF_DIR, NOTAS_DIR):
-                (pasta / f"{alvo}.json").unlink(missing_ok=True)
+            try:
+                supabase.table("notificacoes").delete().eq("aluno_id", alvo).execute()
+                supabase.table("notas").delete().eq("aluno_id", alvo).execute()
+            except Exception as e:
+                log.warning(f"Falha ao limpar dados remotos do aluno: {e}")
             auditar("aluno_excluido", alvo)
             _salvar_e_recarregar("Estudante excluído.")
 
@@ -2089,21 +2303,27 @@ def view_exclusao(aluno, perfil, usuario):
 def view_usuarios(aluno, perfil, usuario):
     st.title("Gerenciador de Acessos & Logins")
     users = DB()["usuarios"]
-    perfis_permitidos = ["professor", "aluno", "familia"] + (["coordenador", "admin"] if perfil == Perfil.ADMIN else [])
+    perfis_permitidos = ["professor", "aluno", "familia"] + (
+        ["coordenador", "admin"] if perfil == Perfil.ADMIN else []
+    )
     t1, t2, t3 = st.tabs(["Usuários Ativos", "Cadastrar Novo", "Redefinir / Remover"])
     with t1:
-        st.dataframe(pd.DataFrame([{"Login": k, "Nome": v["nome"], "Perfil": v["perfil"],
-                                    "Vínculo": v.get("aluno_vinculado") or "Global",
-                                    "Troca pendente": bool(v.get("trocar_senha"))} for k, v in users.items()]),
-                     hide_index=True, **W)
+        st.dataframe(pd.DataFrame([{
+            "Login": k, "Nome": v["nome"], "Perfil": v["perfil"],
+            "Vínculo": v.get("aluno_vinculado") or "Global",
+            "Troca pendente": bool(v.get("trocar_senha")),
+        } for k, v in users.items()]), hide_index=True, **W)
     with t2:
         with st.form("form_cad_u", clear_on_submit=True):
             log_in = st.text_input("Login").strip().lower()
             nom = st.text_input("Nome")
             prf = st.selectbox("Perfil", perfis_permitidos)
             pwd = st.text_input("Senha inicial", type="password")
-            vnc = st.selectbox("Vincular ao Aluno (aluno/família):", [None] + list(DB()["alunos"]),
-                               format_func=lambda x: "—" if x is None else f"{DB()['alunos'][x]['dados']['nome']} ({x})")
+            vnc = st.selectbox(
+                "Vincular ao Aluno (aluno/família):",
+                [None] + list(DB()["alunos"]),
+                format_func=lambda x: "—" if x is None else f"{DB()['alunos'][x]['dados']['nome']} ({x})",
+            )
             if st.form_submit_button("Cadastrar Login"):
                 erro = senha_valida(pwd)
                 if not (log_in and nom.strip()):
@@ -2115,13 +2335,18 @@ def view_usuarios(aluno, perfil, usuario):
                 elif prf in ("aluno", "familia") and not vnc:
                     st.error("Selecione o aluno vinculado.")
                 else:
-                    users[log_in] = {"nome": nom.strip(), "hash_senha": gerar_hash(pwd), "perfil": prf,
-                                     "aluno_vinculado": vnc if prf in ("aluno", "familia") else None, "trocar_senha": True}
+                    users[log_in] = {"nome": nom.strip(),
+                                     "hash_senha": gerar_hash(pwd),
+                                     "perfil": prf,
+                                     "aluno_vinculado": vnc if prf in ("aluno", "familia") else None,
+                                     "trocar_senha": True}
                     auditar("usuario_criado", f"{log_in} ({prf})")
                     _salvar_e_recarregar("Login criado!")
     with t3:
-        gerenciaveis = [k for k, v in users.items() if k != st.session_state.usuario_key
-                        and (perfil == Perfil.ADMIN or v["perfil"] in ("professor", "aluno", "familia"))]
+        gerenciaveis = [k for k, v in users.items()
+                        if k != st.session_state.usuario_key
+                        and (perfil == Perfil.ADMIN
+                             or v["perfil"] in ("professor", "aluno", "familia"))]
         if not gerenciaveis:
             st.info("Nenhum usuário gerenciável.")
             return
@@ -2136,7 +2361,7 @@ def view_usuarios(aluno, perfil, usuario):
                 users[alvo].update(hash_senha=gerar_hash(nova), trocar_senha=True)
                 DB()["bloqueios"].pop(alvo, None)
                 auditar("senha_redefinida", alvo)
-                _salvar_e_recarregar("Senha redefinida (troca obrigatória no próximo login).")
+                _salvar_e_recarregar("Senha redefinida.")
         if c2.button("🗑️ Remover usuário"):
             del users[alvo]
             auditar("usuario_removido", alvo)
@@ -2145,15 +2370,18 @@ def view_usuarios(aluno, perfil, usuario):
 
 def view_auditoria(aluno, perfil, usuario):
     st.title("Log de Auditoria")
-    log_reg = DB().get("auditoria", [])
-    if log_reg:
-        st.dataframe(pd.DataFrame(log_reg[::-1][:300]), hide_index=True, **W)
+    registros = _ler_auditoria(300)
+    if registros:
+        df = pd.DataFrame(registros)
+        cols = [c for c in ["quando", "usuario", "acao", "detalhe",
+                            "valor_antes", "valor_depois"] if c in df.columns]
+        st.dataframe(df[cols], hide_index=True, **W)
     else:
         st.info("Nenhum evento registrado.")
 
 
 # ==============================================================================
-# ROTEAMENTO E ESTRUTURA MODULAR DE NAVEGAÇÃO
+# ROTEAMENTO
 # ==============================================================================
 VIEWS = {
     "📥 Fichas de Estudo (Download)": (view_fichas_aluno, "visualizar", True),
@@ -2269,7 +2497,7 @@ MENU_SIMPLES = {
 
 
 # ==============================================================================
-# LOGIN, SESSÃO E TROCA DE SENHA
+# LOGIN / SESSÃO
 # ==============================================================================
 def logout():
     for k in ["autenticado", "usuario_key", "ultimo_acesso", "pp_idx", "db"]:
@@ -2281,7 +2509,8 @@ def tela_login():
     with c2:
         with st.container(border=True):
             exibir_logo_institucional(190, True)
-            st.markdown("<h3 style='color:#1E3A8A;text-align:center;'>Portal de Aprendizagem & Ensino</h3>", unsafe_allow_html=True)
+            st.markdown("<h3 style='color:#1E3A8A;text-align:center;'>Portal de Aprendizagem & Ensino</h3>",
+                        unsafe_allow_html=True)
             st.caption("Autenticação segura • Processo de Acompanhamento Extensivo")
             with st.form("form_login"):
                 usuario = st.text_input("Usuário").strip().lower()
@@ -2289,13 +2518,12 @@ def tela_login():
                 if st.form_submit_button("Acessar o Sistema"):
                     bloq = DB()["bloqueios"].get(usuario)
                     u = DB()["usuarios"].get(usuario)
-
                     _HASH_FALSO = "pbkdf2$" + "0" * 32 + "$" + "0" * 64
                     hash_alvo = u["hash_senha"] if u else _HASH_FALSO
                     senha_ok = verificar_senha(senha, hash_alvo)
 
                     if bloq and datetime.fromisoformat(bloq["ate"]) > datetime.now():
-                        st.error("Muitas tentativas. Aguarde alguns minutos e tente novamente.")
+                        st.error("Muitas tentativas. Aguarde alguns minutos.")
                     elif u and senha_ok:
                         DB()["bloqueios"].pop(usuario, None)
                         st.session_state.usuario_key = usuario
@@ -2305,7 +2533,8 @@ def tela_login():
                         _salvar_e_recarregar("Login efetuado.")
                     else:
                         if u:
-                            b = DB()["bloqueios"].setdefault(usuario, {"falhas": 0, "ate": "2000-01-01T00:00:00"})
+                            b = DB()["bloqueios"].setdefault(
+                                usuario, {"falhas": 0, "ate": "2000-01-01T00:00:00"})
                             b["falhas"] += 1
                             if b["falhas"] >= MAX_FALHAS:
                                 b["ate"] = (datetime.now() + timedelta(minutes=BLOQUEIO_MIN)).isoformat()
@@ -2349,11 +2578,15 @@ def tela_troca_senha(usuario_key: str):
 
 
 # ==============================================================================
-# APLICAÇÃO PRINCIPAL
+# APP PRINCIPAL
 # ==============================================================================
 def main():
     if "db" not in st.session_state:
-        st.session_state.db = carregar_banco()
+        try:
+            st.session_state.db = carregar_banco()
+        except Exception as e:
+            st.error(f"⚠️ Não foi possível carregar os dados: {e}")
+            st.stop()
 
     _render_flash()
 
@@ -2363,7 +2596,10 @@ def main():
     ult = st.session_state.get("ultimo_acesso")
     if ult and datetime.now() - ult > timedelta(minutes=TEMPO_SESSAO_MIN):
         logout()
-        st.session_state.db = carregar_banco()
+        try:
+            st.session_state.db = carregar_banco()
+        except Exception:
+            pass
         st.warning("Sessão expirada. Faça login novamente.")
         tela_login()
     st.session_state.ultimo_acesso = datetime.now()
@@ -2407,24 +2643,40 @@ def main():
         elif alunos:
             st.markdown("### 🎓 Seleção do Estudante")
 
+            # Professor só vê alunos atribuídos (quando a tabela tiver vínculos)
+            alunos_permitidos = set(alunos.keys())
+            if perfil == Perfil.PROFESSOR:
+                try:
+                    resp = (
+                        supabase.table("professor_aluno")
+                        .select("aluno_id")
+                        .eq("professor_login", chave)
+                        .eq("ativo", True)
+                        .execute()
+                    )
+                    vinculados = {r["aluno_id"] for r in (resp.data or [])}
+                    if vinculados:
+                        alunos_permitidos &= vinculados
+                except Exception as e:
+                    log.warning(f"Falha ao ler vínculos: {e}")
+
             modalidade_filtro = st.selectbox(
                 "1ª Etapa: Modalidade de Ensino",
                 MODALIDADES_VALIDAS,
-                key="sb_modalidade_filtro"
+                key="sb_modalidade_filtro",
             )
-
             alunos_da_modalidade = [
                 k for k, v in alunos.items()
-                if modalidade_filtro in v["dados"].get("modalidades", [v["dados"].get("modalidade")])
+                if k in alunos_permitidos
+                and modalidade_filtro in v["dados"].get("modalidades", [v["dados"].get("modalidade")])
             ]
             alunos_da_modalidade.sort(key=lambda x: alunos[x]["dados"]["nome"])
-
             if alunos_da_modalidade:
                 aid = st.selectbox(
                     "2ª Etapa: Escolha o Estudante",
                     alunos_da_modalidade,
                     format_func=lambda x: f"{alunos[x]['dados']['nome']} ({x})",
-                    key="sb_aluno_filtro"
+                    key="sb_aluno_filtro",
                 )
                 aluno = alunos.get(aid)
             else:
@@ -2452,7 +2704,7 @@ def main():
                 if m in VIEWS and pode(perfil, VIEWS[m][1])
             ]
             if not itens_possiveis:
-                st.info("Nenhuma ação disponível para o seu perfil neste módulo.")
+                st.info("Nenhuma ação disponível neste módulo.")
                 st.stop()
             escolha = st.radio("Selecione a Ação:", itens_possiveis)
 
@@ -2465,12 +2717,13 @@ def main():
                 if m in VIEWS and pode(perfil, VIEWS[m][1])
             ]
             if not itens_possiveis:
-                st.info("Nenhuma ação disponível para o seu perfil neste módulo.")
+                st.info("Nenhuma ação disponível neste módulo.")
                 st.stop()
             escolha = st.radio("Selecione a Ação:", itens_possiveis)
 
         else:
-            itens = [m for m in MENU_SIMPLES[perfil] if m in VIEWS and pode(perfil, VIEWS[m][1])]
+            itens = [m for m in MENU_SIMPLES[perfil]
+                     if m in VIEWS and pode(perfil, VIEWS[m][1])]
             escolha = st.radio("Menu", itens)
 
     funcao, acao, precisa_aluno = VIEWS[escolha]
