@@ -6,48 +6,12 @@ Execução:
 Variáveis de ambiente OBRIGATÓRIAS (o app NÃO inicia se faltar qualquer uma):
     SUPABASE_URL        — URL do projeto Supabase (SEM /rest/v1/ no final)
     SUPABASE_KEY        — Chave `service_role` rotacionada do Supabase (NUNCA commitar)
-    SOS_SENHA_INICIAL   — Senha inicial dos usuários padrão (troca obrigatória
+    SOS_SENHA_INICIAL    — Senha inicial dos usuários padrão (troca obrigatória
                         no primeiro acesso). Deve ter ≥12 caracteres.
 
 Variáveis opcionais:
     SOS_LOG_LEVEL       — DEBUG | INFO | WARNING | ERROR (padrão: INFO)
-    SOS_SESSAO_MIN      — minutos de inatividade até expirar a sessão (padrão: 60)
-
------------------------------------------------------------------------------
-MIGRAÇÕES SQL NECESSÁRIAS (rodar uma vez no SQL Editor do Supabase):
-
-    ALTER TABLE public.sistema_estado
-      ADD COLUMN IF NOT EXISTS versao INTEGER NOT NULL DEFAULT 0;
-
-    INSERT INTO public.sistema_estado (id, dados, versao)
-    VALUES ('estado_global', '{}'::jsonb, 0)
-    ON CONFLICT (id) DO NOTHING;
-
-    CREATE TABLE IF NOT EXISTS public.materiais_oficiais (
-      id            BIGSERIAL PRIMARY KEY,
-      titulo        TEXT NOT NULL,
-      descricao     TEXT DEFAULT '',
-      disciplina    TEXT NOT NULL,
-      serie         TEXT NOT NULL,
-      tipo          TEXT NOT NULL,
-      modulo        TEXT DEFAULT '',
-      tags          TEXT DEFAULT '',
-      autor         TEXT DEFAULT '',
-      versao        TEXT DEFAULT '1.0',
-      file_path     TEXT NOT NULL,
-      file_size_kb  NUMERIC DEFAULT 0,
-      file_ext      TEXT DEFAULT '',
-      criado_por    TEXT DEFAULT '',
-      criado_em     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_mat_disc_serie ON public.materiais_oficiais (disciplina, serie);
-    CREATE INDEX IF NOT EXISTS idx_mat_criado_em  ON public.materiais_oficiais (criado_em DESC);
-
-    INSERT INTO storage.buckets (id, name, public)
-    VALUES ('materiais_oficiais', 'materiais_oficiais', true)
-    ON CONFLICT (id) DO NOTHING;
------------------------------------------------------------------------------
+    SOS_SESSAO_MIN       — minutos de inatividade até expirar a sessão (padrão: 60)
 """
 from __future__ import annotations
 
@@ -78,7 +42,6 @@ from supabase import create_client, Client
 # Configuração de logging estruturado (JSON)
 # ---------------------------------------------------------------------------
 _LOG_LEVEL = os.environ.get("SOS_LOG_LEVEL", "INFO").upper()
-
 
 class _JsonFormatter(logging.Formatter):
     def format(self, record):
@@ -660,40 +623,37 @@ class ConflitoDeVersao(RuntimeError):
     """Levantada quando outra sessão gravou dados no Supabase concorrentemente."""
 
 
-# ---------------------------------------------------------------------------
-# CORRIGIDO: usa coluna INTEGER `versao` (não JSON path) para o teste
-# otimista. Também normaliza a versão como int e evita falso-positivo
-# quando o update retorna data vazio por causa de RLS/tabela ausente.
-# ---------------------------------------------------------------------------
 def salvar_banco(dados: Optional[dict] = None) -> None:
     dados = dados if dados is not None else st.session_state.db
-    try:
-        versao_local = int(dados.get(_VERSAO_ESTADO, 0) or 0)
-    except (TypeError, ValueError):
-        versao_local = 0
+    versao_local = dados.get(_VERSAO_ESTADO, 0)
     nova_versao = versao_local + 1
     dados[_VERSAO_ESTADO] = nova_versao
 
     payload = {
         "id": "estado_global",
         "dados": dados,
-        "versao": nova_versao,
         "atualizado_em": datetime.now(timezone.utc).isoformat(),
     }
 
     try:
-        resp = (
-            supabase.table("sistema_estado")
-            .update(payload)
-            .eq("id", "estado_global")
-            .eq("versao", versao_local)
-            .execute()
-        )
+        if versao_local == 0:
+            resp = (
+                supabase.table("sistema_estado")
+                .update(payload)
+                .eq("id", "estado_global")
+                .execute()
+            )
+        else:
+            resp = (
+                supabase.table("sistema_estado")
+                .update(payload)
+                .eq("id", "estado_global")
+                .eq("dados->>versao", str(versao_local))
+                .execute()
+            )
         if not resp.data:
             dados[_VERSAO_ESTADO] = versao_local
-            raise ConflitoDeVersao(
-                "Outra sessão atualizou os dados. Suas últimas alterações foram descartadas — refaça-as."
-            )
+            raise ConflitoDeVersao("Outra sessão atualizou os dados. Suas últimas alterações foram descartadas — refaça-as.")
         _carregar_banco_remoto.clear()
         log.info(f"Estado salvo versao={nova_versao}")
     except ConflitoDeVersao:
@@ -710,12 +670,12 @@ def _carregar_banco_remoto() -> Optional[dict]:
     try:
         resp = (
             supabase.table("sistema_estado")
-            .select("dados,versao")
+            .select("dados")
             .eq("id", "estado_global")
             .execute()
         )
         if resp.data:
-            return resp.data[0]
+            return resp.data[0]["dados"]
     except Exception as e:
         log.warning(f"Falha ao carregar do Supabase: {type(e).__name__}: {e}")
     return None
@@ -726,14 +686,19 @@ def carregar_banco(forcar: bool = False) -> dict:
         _carregar_banco_remoto.clear()
 
     remoto = _carregar_banco_remoto()
-    if remoto and isinstance(remoto, dict) and "dados" in remoto:
-        dados = sanitizar_banco(remoto["dados"])
-        # Sincroniza versão a partir da coluna INTEGER, não do JSON
-        try:
-            if remoto.get("versao") is not None:
-                dados[_VERSAO_ESTADO] = int(remoto["versao"])
-        except (TypeError, ValueError):
-            pass
+    if remoto:
+        dados = sanitizar_banco(remoto)
+        if _VERSAO_ESTADO not in remoto:
+            log.info("Migrando registro sem campo versao remoto")
+            try:
+                supabase.table("sistema_estado").update({
+                    "id": "estado_global",
+                    "dados": dados,
+                    "atualizado_em": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", "estado_global").execute()
+                _carregar_banco_remoto.clear()
+            except Exception as e:
+                log.error(f"Falha na migração de versão: {type(e).__name__}: {e}")
         return dados
 
     dados = criar_banco_padrao()
@@ -741,7 +706,6 @@ def carregar_banco(forcar: bool = False) -> dict:
         supabase.table("sistema_estado").insert({
             "id": "estado_global",
             "dados": dados,
-            "versao": 0,
             "atualizado_em": datetime.now(timezone.utc).isoformat(),
         }).execute()
         log.info("Bootstrap concluído no Supabase")
@@ -999,10 +963,6 @@ MAT_MODULOS = ["Módulo 1", "Módulo 2", "Módulo 3", "Módulo 4",
                "Revisão", "Extensivo", "Intensivo"]
 
 
-# ---------------------------------------------------------------------------
-# CORRIGIDO: busca aplicada em Python (evita .or_ com ilike quebrando
-# quando `tags`/`autor` são NULL no Postgres) e tratamento de erro visível.
-# ---------------------------------------------------------------------------
 def mat_listar_nuvem(filtros: dict = None) -> list:
     try:
         query = supabase.table("materiais_oficiais").select("*")
@@ -1013,38 +973,15 @@ def mat_listar_nuvem(filtros: dict = None) -> list:
                 query = query.eq("serie", filtros["serie"])
             if filtros.get("tipo") and filtros["tipo"] != "Todos":
                 query = query.eq("tipo", filtros["tipo"])
+            if filtros.get("busca"):
+                busca = filtros["busca"]
+                query = query.or_(f"titulo.ilike.%{busca}%,descricao.ilike.%{busca}%,tags.ilike.%{busca}%")
 
         resp = query.order("criado_em", desc=True).execute()
-        dados = resp.data or []
-
-        busca = (filtros or {}).get("busca", "").strip().lower()
-        if busca:
-            dados = [
-                m for m in dados
-                if busca in (m.get("titulo") or "").lower()
-                or busca in (m.get("descricao") or "").lower()
-                or busca in (m.get("tags") or "").lower()
-                or busca in (m.get("autor") or "").lower()
-            ]
-        return dados
+        return resp.data or []
     except Exception as e:
-        log.error(f"Erro ao listar materiais do Supabase: {type(e).__name__}: {e}")
-        st.error(f"⚠️ Erro ao consultar materiais: {e}")
+        log.error(f"Erro ao listar materiais do Supabase: {e}")
         return []
-
-
-def _garantir_bucket() -> None:
-    """Garante que o bucket de materiais existe (idempotente)."""
-    try:
-        existentes = {
-            (b.name if hasattr(b, "name") else b.get("name"))
-            for b in supabase.storage.list_buckets()
-        }
-        if SUPABASE_BUCKET not in existentes:
-            supabase.storage.create_bucket(SUPABASE_BUCKET, options={"public": True})
-            log.info(f"Bucket '{SUPABASE_BUCKET}' criado.")
-    except Exception as e:
-        log.warning(f"Verificação/criação de bucket falhou: {type(e).__name__}: {e}")
 
 
 def view_material_oficial(aluno, perfil, usuario):
@@ -1147,26 +1084,19 @@ def view_material_oficial(aluno, perfil, usuario):
                     elif not arquivo:
                         st.error("É necessário anexar um arquivo.")
                     else:
-                        # 1) Garantir bucket (idempotente)
-                        _garantir_bucket()
-
-                        # 2) Upload Storage + Insert tabela
                         try:
                             ext = Path(arquivo.name).suffix.lower().lstrip(".")
                             nome_unico = f"{uuid.uuid4().hex[:8]}_{nome_seguro(arquivo.name)}"
                             caminho_storage = f"{disciplina}/{serie}/{nome_unico}"
-                            file_bytes = arquivo.getvalue()
 
+                            file_bytes = arquivo.getvalue()
                             supabase.storage.from_(SUPABASE_BUCKET).upload(
                                 path=caminho_storage,
                                 file=file_bytes,
-                                file_options={
-                                    "content-type": arquivo.type or "application/octet-stream",
-                                    "upsert": "false",
-                                },
+                                file_options={"content-type": arquivo.type or "application/octet-stream"}
                             )
 
-                            u_nome = usuario.get("nome") if isinstance(usuario, dict) else str(usuario)
+                            u_nome = usuario["nome"] if isinstance(usuario, dict) else str(usuario)
                             supabase.table("materiais_oficiais").insert({
                                 "titulo": titulo.strip(),
                                 "descricao": descricao.strip(),
@@ -1176,44 +1106,26 @@ def view_material_oficial(aluno, perfil, usuario):
                                 "modulo": modulo,
                                 "tags": tags.strip(),
                                 "autor": autor.strip(),
-                                "versao": (versao.strip() or "1.0"),
+                                "versao": versao.strip() or "1.0",
                                 "file_path": caminho_storage,
                                 "file_size_kb": round(len(file_bytes) / 1024, 2),
                                 "file_ext": ext,
-                                "criado_por": u_nome,
+                                "criado_por": u_nome
                             }).execute()
-                        except Exception as e:
-                            log.error(f"Erro no upload para o Supabase: {type(e).__name__}: {e}")
-                            st.error(f"❌ Falha no upload: {e}")
-                            st.stop()
 
-                        # 3) Notificações em lote (não bloqueia o fluxo)
-                        try:
-                            enviados = 0
-                            for aid in DB()["alunos"]:
-                                notificar(aid, "📚 Novo material na nuvem",
-                                          f"{tipo}: {titulo.strip()} ({disciplina} • {serie})",
-                                          tipo="info", origem="professor")
-                                enviados += 1
-                                if enviados >= 200:
-                                    break
-                        except Exception as e:
-                            log.warning(f"Notificações parciais: {e}")
+                            try:
+                                for aid in DB()["alunos"]:
+                                    notificar(aid, "📚 Novo material na nuvem",
+                                              f"{tipo}: {titulo.strip()} ({disciplina} • {serie})",
+                                              tipo="info", origem="professor")
+                            except Exception:
+                                pass
 
-                        # 4) Auditoria + salvamento NÃO-BLOQUEANTE do DB global
-                        auditar("material_nuvem_criado", titulo.strip())
-                        try:
-                            salvar_banco()
-                        except ConflitoDeVersao:
-                            _carregar_banco_remoto.clear()
-                            st.session_state.db = carregar_banco(forcar=True)
+                            auditar("material_nuvem_criado", titulo.strip())
+                            _salvar_e_recarregar("✅ Material enviado e salvo com sucesso na nuvem!")
                         except Exception as e:
-                            log.warning(f"DB não salvo após upload (material já está OK): {e}")
-
-                        # 5) Material JÁ ESTÁ persistido → só recarrega a lista
-                        _carregar_banco_remoto.clear()
-                        _flash("success", f"✅ Material '{titulo.strip()}' publicado com sucesso!")
-                        st.rerun()
+                            log.error(f"Erro no upload para o Supabase Storage: {e}")
+                            st.error(f"Erro ao gravar arquivo na nuvem: {e}")
 
 
 # ==============================================================================
@@ -2149,7 +2061,7 @@ def view_produtividade(aluno, perfil, usuario):
     st.title("Produtividade da Equipe Pedagógica")
     rows = []
     for p in DB().get("professores", []):
-        ats = [s for al in DB()["alunos"].values() for s in al.get("atendimentos_processo", []) if s.get("professor") == p["nome"]]
+        ats = [s for al in DB()["alunos"].values() for s in al.get("atendimentos_processo", []) if s.get("professor"] == p["nome"]]
         h = sum(s.get("duracao_h", 1.5) for s in ats)
         rows.append({"Professor": p["nome"], "Disciplina": p["disciplina"], "Aulas": len(ats),
                      "Horas": round(h, 2), "Repasse Estimado (R$)": round(h * p.get("valor_hora", 90), 2)})
@@ -2240,7 +2152,7 @@ def view_usuarios(aluno, perfil, usuario):
                 if not (log_in and nom.strip()):
                     st.error("Preencha login e nome.")
                 elif log_in in users:
-                    st.error("Este login já existe.")
+                    st.error(" Este login já existe.")
                 elif erro:
                     st.error(erro)
                 elif prf in ("aluno", "familia") and not vnc:
