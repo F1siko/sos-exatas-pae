@@ -997,135 +997,92 @@ def view_material_oficial(aluno, perfil, usuario):
     k[2].metric("☁️ Armazenamento", "Supabase Storage (100% Persistente)")
     st.markdown("---")
 
-    tem_permissao_criar = pode(perfil, "criar")
-
-    if tem_permissao_criar:
-        abas = st.tabs(["🔍 Biblioteca de Materiais", "➕ Cadastrar Novo Material"])
-    else:
-        abas = [st.container()]
-
-    with abas[0]:
-        st.markdown("### 🔍 Buscar Materiais na Nuvem")
-        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    # Formulário direto para teste imediato de cadastro
+    st.markdown("### ➕ Cadastrar Novo Material na Nuvem")
+    with st.form("form_material_nuvem", clear_on_submit=True):
+        c1, c2 = st.columns(2)
         with c1:
-            busca = st.text_input("🔎 Buscar por título, tag, autor...", key="mat_busca_nuvem")
+            titulo = st.text_input("Título *")
+            disciplina = st.selectbox("Disciplina *", MAT_DISCIPLINAS)
+            serie = st.selectbox("Série *", MAT_SERIES)
+            tipo = st.selectbox("Tipo *", MAT_TIPOS)
         with c2:
-            f_disc = st.selectbox("Disciplina", ["Todas"] + MAT_DISCIPLINAS, key="mat_f_disc_nuvem")
-        with c3:
-            f_serie = st.selectbox("Série", ["Todas"] + MAT_SERIES, key="mat_f_serie_nuvem")
-        with c4:
-            f_tipo = st.selectbox("Tipo", ["Todos"] + MAT_TIPOS, key="mat_f_tipo_nuvem")
+            modulo = st.selectbox("Módulo", [""] + MAT_MODULOS)
+            autor = st.text_input("Autor / Fonte")
+            versao = st.text_input("Versão", value="1.0")
+            tags = st.text_input("Tags (separadas por vírgula)")
 
-        filtrados = mat_listar_nuvem({"busca": busca.strip(), "disciplina": f_disc, "serie": f_serie, "tipo": f_tipo})
-        st.caption(f"📌 **{len(filtrados)}** material(is) encontrado(s)")
+        descricao = st.text_area("Descrição", height=80)
+        st.markdown("**📎 Arquivo do Material (Salvo no Supabase Storage)**")
+        arquivo = st.file_uploader(
+            "Selecione o arquivo",
+            type=["pdf", "docx", "doc", "xlsx", "pptx", "png", "jpg", "jpeg", "zip"],
+            label_visibility="collapsed"
+        )
+        submit = st.form_submit_button("💾 Enviar para o Supabase Storage", type="primary", **W)
 
-        if not filtrados:
-            st.info("📭 Nenhum material encontrado com os filtros aplicados.")
-            return
+        if submit:
+            if not titulo.strip():
+                st.error("O campo **Título** é obrigatório.")
+            elif not arquivo:
+                st.error("É necessário anexar um arquivo.")
+            else:
+                try:
+                    ext = Path(arquivo.name).suffix.lower().lstrip(".")
+                    nome_unico = f"{uuid.uuid4().hex[:8]}_{nome_seguro(arquivo.name)}"
+                    caminho_storage = f"{disciplina}/{serie}/{nome_unico}"
 
-        for m in filtrados:
-            icone = {"Apostila": "📕", "Lista de Exercícios": "📝", "Resumo": "📄",
-                     "Simulado": "🧪", "Prova": "📋", "Gabarito": "✅",
-                     "Vídeo-aula": "🎥", "Mapa Mental": "🧠", "Outro": "📎"}.get(m.get("tipo"), "📎")
-            with st.expander(f"{icone} {m['titulo']} — {m['disciplina']} • {m['serie']} (v{m.get('versao', '1.0')})"):
-                a, b = st.columns([3, 1])
-                with a:
-                    if m.get("descricao"):
-                        st.markdown(f"**📝 Descrição:** {esc(m['descricao'])}")
-                    c1, c2, c3 = st.columns(3)
-                    c1.markdown(f"**📖 Disciplina:** {m['disciplina']}")
-                    c2.markdown(f"**🎓 Série:** {m['serie']}")
-                    c3.markdown(f"**🏷️ Tipo:** {m['tipo']}")
-                    c4, c5 = st.columns(2)
-                    c4.markdown(f"**📦 Módulo:** {m.get('modulo') or '—'}")
-                    c5.markdown(f"**👤 Autor:** {esc(m.get('autor') or '—')}")
-                    if m.get("tags"):
-                        st.markdown(f"**🏷️ Tags:** `{esc(m['tags'])}`")
-                with b:
-                    st.markdown("**📊 Info Nuvem**")
-                    st.caption(f"💾 {m.get('file_size_kb', 0)} KB")
-                    st.caption(f"🗓️ {str(m.get('criado_em', ''))[:10]}")
-                    st.caption(f"📎 .{m.get('file_ext', '?')}")
+                    file_bytes = arquivo.getvalue()
+                    supabase.storage.from_(SUPABASE_BUCKET).upload(
+                        path=caminho_storage,
+                        file=file_bytes,
+                        file_options={"content-type": arquivo.type or "application/octet-stream"}
+                    )
 
+                    u_nome = usuario["nome"] if isinstance(usuario, dict) else str(usuario)
+                    supabase.table("materiais_oficiais").insert({
+                        "titulo": titulo.strip(),
+                        "descricao": descricao.strip(),
+                        "disciplina": disciplina,
+                        "serie": serie,
+                        "tipo": tipo,
+                        "modulo": modulo,
+                        "tags": tags.strip(),
+                        "autor": autor.strip(),
+                        "versao": versao.strip() or "1.0",
+                        "file_path": caminho_storage,
+                        "file_size_kb": round(len(file_bytes) / 1024, 2),
+                        "file_ext": ext,
+                        "criado_por": u_nome
+                    }).execute()
+
+                    try:
+                        for aid in DB()["alunos"]:
+                            notificar(aid, "📚 Novo material na nuvem",
+                                      f"{tipo}: {titulo.strip()} ({disciplina} • {serie})",
+                                      tipo="info", origem="professor")
+                    except Exception:
+                        pass
+
+                    auditar("material_nuvem_criado", titulo.strip())
+                    _salvar_e_recarregar("✅ Material enviado e salvo com sucesso na nuvem!")
+                except Exception as e:
+                    log.error(f"Erro no upload para o Supabase Storage: {e}")
+                    st.error(f"Erro ao gravar arquivo na nuvem: {e}")
+
+    st.markdown("---")
+    st.markdown("### 🔍 Biblioteca de Materiais Cadastrados")
+    if not materiais:
+        st.info("📭 Nenhum material cadastrado na nuvem até o momento.")
+    else:
+        for m in materiais:
+            with st.container(border=True):
+                st.markdown(f"**{m['titulo']}** — {m['disciplina']} • {m['serie']} ({m['tipo']})")
                 try:
                     url_publica = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(m["file_path"])
-                    st.markdown(f"[📥 Baixar / Visualizar Arquivo na Nuvem]({url_publica})", unsafe_allow_html=True)
-                except Exception as e:
-                    st.error(f"Erro ao gerar link de download: {e}")
-
-    if tem_permissao_criar and len(abas) > 1:
-        with abas[1]:
-            st.markdown("### ➕ Cadastrar Novo Material na Nuvem")
-            with st.form("form_material_nuvem", clear_on_submit=True):
-                c1, c2 = st.columns(2)
-                with c1:
-                    titulo = st.text_input("Título *")
-                    disciplina = st.selectbox("Disciplina *", MAT_DISCIPLINAS)
-                    serie = st.selectbox("Série *", MAT_SERIES)
-                    tipo = st.selectbox("Tipo *", MAT_TIPOS)
-                with c2:
-                    modulo = st.selectbox("Módulo", [""] + MAT_MODULOS)
-                    autor = st.text_input("Autor / Fonte")
-                    versao = st.text_input("Versão", value="1.0")
-                    tags = st.text_input("Tags (separadas por vírgula)")
-
-                descricao = st.text_area("Descrição", height=80)
-                st.markdown("**📎 Arquivo do Material (Salvo no Supabase Storage)**")
-                arquivo = st.file_uploader(
-                    "Selecione o arquivo",
-                    type=["pdf", "docx", "doc", "xlsx", "pptx", "png", "jpg", "jpeg", "zip"],
-                    label_visibility="collapsed"
-                )
-                submit = st.form_submit_button("💾 Enviar para o Supabase Storage", type="primary", **W)
-
-                if submit:
-                    if not titulo.strip():
-                        st.error("O campo **Título** é obrigatório.")
-                    elif not arquivo:
-                        st.error("É necessário anexar um arquivo.")
-                    else:
-                        try:
-                            ext = Path(arquivo.name).suffix.lower().lstrip(".")
-                            nome_unico = f"{uuid.uuid4().hex[:8]}_{nome_seguro(arquivo.name)}"
-                            caminho_storage = f"{disciplina}/{serie}/{nome_unico}"
-
-                            file_bytes = arquivo.getvalue()
-                            supabase.storage.from_(SUPABASE_BUCKET).upload(
-                                path=caminho_storage,
-                                file=file_bytes,
-                                file_options={"content-type": arquivo.type or "application/octet-stream"}
-                            )
-
-                            u_nome = usuario["nome"] if isinstance(usuario, dict) else str(usuario)
-                            supabase.table("materiais_oficiais").insert({
-                                "titulo": titulo.strip(),
-                                "descricao": descricao.strip(),
-                                "disciplina": disciplina,
-                                "serie": serie,
-                                "tipo": tipo,
-                                "modulo": modulo,
-                                "tags": tags.strip(),
-                                "autor": autor.strip(),
-                                "versao": versao.strip() or "1.0",
-                                "file_path": caminho_storage,
-                                "file_size_kb": round(len(file_bytes) / 1024, 2),
-                                "file_ext": ext,
-                                "criado_por": u_nome
-                            }).execute()
-
-                            try:
-                                for aid in DB()["alunos"]:
-                                    notificar(aid, "📚 Novo material na nuvem",
-                                              f"{tipo}: {titulo.strip()} ({disciplina} • {serie})",
-                                              tipo="info", origem="professor")
-                            except Exception:
-                                pass
-
-                            auditar("material_nuvem_criado", titulo.strip())
-                            _salvar_e_recarregar("✅ Material enviado e salvo com sucesso na nuvem!")
-                        except Exception as e:
-                            log.error(f"Erro no upload para o Supabase Storage: {e}")
-                            st.error(f"Erro ao gravar arquivo na nuvem: {e}")
+                    st.markdown(f"[📥 Baixar Ficha]({url_publica})", unsafe_allow_html=True)
+                except Exception:
+                    pass
 
 
 # ==============================================================================
@@ -2152,7 +2109,7 @@ def view_usuarios(aluno, perfil, usuario):
                 if not (log_in and nom.strip()):
                     st.error("Preencha login e nome.")
                 elif log_in in users:
-                    st.error(" Este login já existe.")
+                    st.error("Este login já existe.")
                 elif erro:
                     st.error(erro)
                 elif prf in ("aluno", "familia") and not vnc:
