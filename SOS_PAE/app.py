@@ -30,8 +30,6 @@ from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from html import escape as esc
 from pathlib import Path
-from dotenv import load_dotenv
-load_dotenv()
 from typing import Optional
 from xml.sax.saxutils import escape as xml_esc
 
