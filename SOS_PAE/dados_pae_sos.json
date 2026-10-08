@@ -1,0 +1,78 @@
+{
+  "professores": [
+    {
+      "id": "PROF-01",
+      "nome": "Prof. Heitor Albuquerque",
+      "disciplina": "Física"
+    },
+    {
+      "id": "PROF-02",
+      "nome": "Prof. Ésio Tavares",
+      "disciplina": "Química"
+    },
+    {
+      "id": "PROF-03",
+      "nome": "Prof. Lucas Mendes",
+      "disciplina": "Matemática"
+    }
+  ],
+  "alunos": {
+    "ALU-104": {
+      "dados": {
+        "id": "ALU-104",
+        "nome": "Timoteo",
+        "modalidade": "Banca de Estudos",
+        "escola": "Colégio de Aplicação",
+        "serie": "1º Ano EM",
+        "turno": "Tarde",
+        "contato": "81987848696",
+        "responsaveis": "Ésio Tavares( )",
+        "objetivo_macro": "Medicina (ENEM/SSA)",
+        "vestibulares": [
+          "ENEM",
+          "SSA/UPE",
+          "ITA/IME"
+        ],
+        "data_matricula": "2026-09-29",
+        "foto_path": "fotos_alunos_sos\\ALU-104_1790663174.jpg",
+        "links_online": []
+      },
+      "operacao": {
+        "horas_contratadas": 12.0,
+        "horas_realizadas": 0.0,
+        "presencas": 0,
+        "faltas": 0,
+        "reposicoes_pendentes": 0
+      },
+      "planejamento": {
+        "meta_semana": "Definir meta do ciclo de entrada.",
+        "rotina_semanal": "A agendar.",
+        "topicos_prioritarios": "Diagnóstico de base estruturante."
+      },
+      "agenda_aulas": [],
+      "anamnese": {
+        "historico": "",
+        "relacao_exatas": "",
+        "rotina_liquida": "",
+        "habitos": "",
+        "expectativa_familia": ""
+      },
+      "relatorios_aulas": [],
+      "fichas_pdf": [],
+      "pae_ativo": {
+        "versao": "v1.0",
+        "data_replanejamento": "2026-09-29",
+        "dominio_habilidades": {
+          "HAB-FIS-01": {
+            "score": 0.0,
+            "status": "A iniciar"
+          },
+          "HAB-FIS-02": {
+            "score": 0.0,
+            "status": "A iniciar"
+          }
+        }
+      }
+    }
+  }
+}
