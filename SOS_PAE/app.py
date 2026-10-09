@@ -1116,7 +1116,7 @@ def view_material_oficial(aluno, perfil, usuario):
                 for m in materiais:
                     with st.container(border=True):
                         st.markdown(f"**{m['titulo']}** — {m['disciplina']} • {m['serie']}")
-                        if st.button("🗑️ Excluir Material", key=f"del_mat_{m.get('id', m['file_path'])}}"):
+                        if st.button("🗑️ Excluir Material", key=f"del_mat_{m.get('id', m.get('file_path', ''))}"):
                             try:
                                 supabase.storage.from_(SUPABASE_BUCKET).remove([m["file_path"]])
                                 supabase.table("materiais_oficiais").delete().eq("id", m["id"]).execute()
@@ -1133,6 +1133,7 @@ def view_material_oficial(aluno, perfil, usuario):
                 st.dataframe(pd.DataFrame(audits[::-1][:50]), hide_index=True, **W)
             else:
                 st.info("Nenhum evento de auditoria de materiais registrado.")
+
 
 # ==============================================================================
 # GESTÃO DE FICHAS (COM SELEÇÃO DIRETA DA BIBLIOTECA)
