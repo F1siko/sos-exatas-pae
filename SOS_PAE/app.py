@@ -1007,82 +1007,132 @@ def view_material_oficial(aluno, perfil, usuario):
     k[2].metric("☁️ Armazenamento", "Supabase Storage (100% Persistente)")
     st.markdown("---")
 
-    st.markdown("### ➕ Cadastrar Novo Material na Nuvem")
-    with st.form("form_material_nuvem", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            titulo = st.text_input("Título *")
-            disciplina = st.selectbox("Disciplina *", MAT_DISCIPLINAS)
-            serie = st.selectbox("Série *", MAT_SERIES)
-            tipo = st.selectbox("Tipo *", MAT_TIPOS)
-        with c2:
-            modulo = st.selectbox("Módulo", [""] + MAT_MODULOS)
-            autor = st.text_input("Autor / Fonte")
-            versao = st.text_input("Versão", value="1.0")
-            tags = st.text_input("Tags (separadas por vírgula)")
+    tem_permissao_criar = pode(perfil, "criar")
 
-        descricao = st.text_area("Descrição", height=80)
-        st.markdown("**📎 Arquivo do Material (Salvo no Supabase Storage)**")
-        arquivo = st.file_uploader(
-            "Selecione o arquivo",
-            type=["pdf", "docx", "doc", "xlsx", "pptx", "png", "jpg", "jpeg", "zip"],
-            label_visibility="collapsed"
-        )
-        submit = st.form_submit_button("💾 Enviar para o Supabase Storage", type="primary", **W)
-
-        if submit:
-            if not titulo.strip():
-                st.error("O campo **Título** é obrigatório.")
-            elif not arquivo:
-                st.error("É necessário anexar um arquivo.")
-            else:
-                try:
-                    ext = Path(arquivo.name).suffix.lower().lstrip(".")
-                    caminho_storage = _caminho_storage_seguro(disciplina, serie, arquivo.name)
-
-                    file_bytes = arquivo.getvalue()
-                    supabase.storage.from_(SUPABASE_BUCKET).upload(
-                        path=caminho_storage,
-                        file=file_bytes,
-                        file_options={"content-type": arquivo.type or "application/octet-stream"}
-                    )
-
-                    u_nome = usuario["nome"] if isinstance(usuario, dict) else str(usuario)
-                    supabase.table("materiais_oficiais").insert({
-                        "titulo": titulo.strip(),
-                        "descricao": descricao.strip(),
-                        "disciplina": disciplina,
-                        "serie": serie,
-                        "tipo": tipo,
-                        "modulo": modulo,
-                        "tags": tags.strip(),
-                        "autor": autor.strip(),
-                        "versao": versao.strip() or "1.0",
-                        "file_path": caminho_storage,
-                        "file_size_kb": round(len(file_bytes) / 1024, 2),
-                        "file_ext": ext,
-                        "criado_por": u_nome
-                    }).execute()
-
-                    auditar("material_nuvem_criado", titulo.strip())
-                    _salvar_e_recarregar("✅ Material enviado e salvo com sucesso na nuvem!")
-                except Exception as e:
-                    log.error(f"Erro no upload para o Supabase Storage: {e}")
-                    st.error(f"Erro ao gravar arquivo na nuvem: {e}")
-
-    st.markdown("---")
-    st.markdown("### 🔍 Biblioteca de Materiais Cadastrados")
-    if not materiais:
-        st.info("📭 Nenhum material cadastrado na nuvem até o momento.")
+    if tem_permissao_criar:
+        abas = st.tabs(["🔍 Biblioteca", "➕ Cadastrar", "✏️ Gerenciar", "📋 Auditoria"])
     else:
-        for m in materiais:
-            with st.container(border=True):
-                st.markdown(f"**{m['titulo']}** — {m['disciplina']} • {m['serie']} ({m['tipo']})")
-                try:
-                    url_publica = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(m["file_path"])
-                    st.markdown(f"[📥 Baixar Ficha]({url_publica})", unsafe_allow_html=True)
-                except Exception:
-                    pass
+        abas = [st.container()]
+
+    with abas[0]:
+        st.markdown("### 🔍 Buscar Materiais")
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+        with c1:
+            busca = st.text_input("🔍 Buscar por título, tag, autor...", key="mat_busca_nuvem")
+        with c2:
+            f_disc = st.selectbox("Disciplina", ["Todas"] + MAT_DISCIPLINAS, key="mat_f_disc_nuvem")
+        with c3:
+            f_serie = st.selectbox("Série", ["Todas"] + MAT_SERIES, key="mat_f_serie_nuvem")
+        with c4:
+            f_tipo = st.selectbox("Tipo", ["Todos"] + MAT_TIPOS, key="mat_f_tipo_nuvem")
+
+        filtrados = mat_listar_nuvem({"busca": busca.strip(), "disciplina": f_disc, "serie": f_serie, "tipo": f_tipo})
+        st.caption(f"📌 **{len(filtrados)}** material(is) encontrado(s)")
+
+        if not filtrados:
+            st.info("📭 Nenhum material encontrado com os filtros aplicados.")
+        else:
+            for m in filtrados:
+                with st.expander(f"📕 {m['titulo']} — {m['disciplina']} • {m['serie']}"):
+                    st.write(f"**Tipo:** {m['tipo']} | **Módulo:** {m.get('modulo', '—')} | **Autor:** {esc(m.get('autor', '—'))}")
+                    if m.get("descricao"):
+                        st.write(f"**Descrição:** {esc(m['descricao'])}")
+                    try:
+                        url_publica = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(m["file_path"])
+                        st.markdown(f"[📥 Baixar Ficha]({url_publica})", unsafe_allow_html=True)
+                    except Exception:
+                        pass
+
+    if tem_permissao_criar and len(abas) > 1:
+        with abas[1]:
+            st.markdown("### ➕ Cadastrar Novo Material na Nuvem")
+            with st.form("form_material_nuvem", clear_on_submit=True):
+                c1, c2 = st.columns(2)
+                with c1:
+                    titulo = st.text_input("Título *")
+                    disciplina = st.selectbox("Disciplina *", MAT_DISCIPLINAS)
+                    serie = st.selectbox("Série *", MAT_SERIES)
+                    tipo = st.selectbox("Tipo *", MAT_TIPOS)
+                with c2:
+                    modulo = st.selectbox("Módulo", [""] + MAT_MODULOS)
+                    autor = st.text_input("Autor / Fonte")
+                    versao = st.text_input("Versão", value="1.0")
+                    tags = st.text_input("Tags (separadas por vírgula)")
+
+                descricao = st.text_area("Descrição", height=80)
+                st.markdown("**📎 Arquivo do Material (Salvo no Supabase Storage)**")
+                arquivo = st.file_uploader(
+                    "Selecione o arquivo",
+                    type=["pdf", "docx", "doc", "xlsx", "pptx", "png", "jpg", "jpeg", "zip"],
+                    label_visibility="collapsed"
+                )
+                submit = st.form_submit_button("💾 Enviar para o Supabase Storage", type="primary", **W)
+
+                if submit:
+                    if not titulo.strip():
+                        st.error("O campo **Título** é obrigatório.")
+                    elif not arquivo:
+                        st.error("É necessário anexar um arquivo.")
+                    else:
+                        try:
+                            ext = Path(arquivo.name).suffix.lower().lstrip(".")
+                            caminho_storage = _caminho_storage_seguro(disciplina, serie, arquivo.name)
+
+                            file_bytes = arquivo.getvalue()
+                            supabase.storage.from_(SUPABASE_BUCKET).upload(
+                                path=caminho_storage,
+                                file=file_bytes,
+                                file_options={"content-type": arquivo.type or "application/octet-stream"}
+                            )
+
+                            u_nome = usuario["nome"] if isinstance(usuario, dict) else str(usuario)
+                            supabase.table("materiais_oficiais").insert({
+                                "titulo": titulo.strip(),
+                                "descricao": descricao.strip(),
+                                "disciplina": disciplina,
+                                "serie": serie,
+                                "tipo": tipo,
+                                "modulo": modulo,
+                                "tags": tags.strip(),
+                                "autor": autor.strip(),
+                                "versao": versao.strip() or "1.0",
+                                "file_path": caminho_storage,
+                                "file_size_kb": round(len(file_bytes) / 1024, 2),
+                                "file_ext": ext,
+                                "criado_por": u_nome
+                            }).execute()
+
+                            auditar("material_nuvem_criado", titulo.strip())
+                            _salvar_e_recarregar("✅ Material enviado e salvo com sucesso na nuvem!")
+                        except Exception as e:
+                            log.error(f"Erro no upload para o Supabase Storage: {e}")
+                            st.error(f"Erro ao gravar arquivo na nuvem: {e}")
+
+        with abas[2]:
+            st.markdown("### ✏️ Gerenciar Materiais Existentes")
+            if not materiais:
+                st.info("Nenhum material cadastrado para gerenciar.")
+            else:
+                for m in materiais:
+                    with st.container(border=True):
+                        st.markdown(f"**{m['titulo']}** — {m['disciplina']} • {m['serie']}")
+                        if st.button("🗑️ Excluir Material", key=f"del_mat_{m.get('id', m['file_path'])"):
+                            try:
+                                supabase.storage.from_(SUPABASE_BUCKET).remove([m["file_path"]])
+                                supabase.table("materiais_oficiais").delete().eq("id", m["id"]).execute()
+                                auditar("material_excluido", m["titulo"])
+                                _salvar_e_recarregar("Material excluído com sucesso!")
+                            except Exception as e:
+                                st.error(f"Erro ao excluir material: {e}")
+
+        with abas[3]:
+            st.markdown("### 📋 Auditoria de Materiais")
+            st.caption("Histórico recente de interações com o acervo de materiais oficiais.")
+            audits = [a for a in DB().get("auditoria", []) if "material" in a.get("acao", "")]
+            if audits:
+                st.dataframe(pd.DataFrame(audits[::-1][:50]), hide_index=True, **W)
+            else:
+                st.info("Nenhum evento de auditoria de materiais registrado.")
 
 
 # ==============================================================================
